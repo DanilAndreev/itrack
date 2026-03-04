@@ -3,7 +3,17 @@ project(itrack CUDA)
 
 set(CMAKE_CUDA_STANDARD 20)
 
-add_executable(itrack main.cu)
+set(SOURCE_FILES
+        src/main.cu
+        src/stb_impl.cu
+    )
+set(HEADER_FILES
+        src/pch.h
+)
+
+add_executable(itrack ${HEADER_FILES} ${SOURCE_FILES})
+target_precompile_headers(itrack PRIVATE src/pch.h)
+set_source_files_properties(${HEADER_FILES} PROPERTIES HEADER_FILE_ONLY TRUE)
 
 set_target_properties(itrack PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
