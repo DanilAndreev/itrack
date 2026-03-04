@@ -8,11 +8,11 @@ set(SOURCE_FILES
         src/stb_impl.cu
     )
 set(HEADER_FILES
-        src/pch.h
+        src/pch.cuh
 )
 
 add_executable(itrack ${HEADER_FILES} ${SOURCE_FILES})
-target_precompile_headers(itrack PRIVATE src/pch.h)
+target_precompile_headers(itrack PRIVATE src/pch.cuh)
 set_source_files_properties(${HEADER_FILES} PROPERTIES HEADER_FILE_ONLY TRUE)
 
 set_target_properties(itrack PROPERTIES
