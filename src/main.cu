@@ -1,21 +1,34 @@
 #include "pch.cuh"
 #include <stb_image.h>
 
+
 using uint = uint32_t;
 
 namespace Kernels {
-    template<class T>
-    __global__ void MaxReduce(T* input, T* outputSum, T* scratchReduce) {
-        T minVal = input[threadIdx.x];
-        T maxVal = minVal;
+    template<bool FirstPass, class T, T MaxT = std::numeric_limits<T>::max(), T MinT = std::numeric_limits<T>::min()>
+    __global__ void MaxReduce(T* input, T* outputSum, T* scratchReduce, uint inputElCount) {
+        T minVal = MaxT;
+        T maxVal = MinT;
+        if (FirstPass) {
+            uint inIdx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (inIdx < inputElCount) {
+                minVal = input[inIdx];
+                maxVal = minVal;
+            }
+        } else {
+            uint inIdx = blockIdx.x * blockDim.x * 2 + threadIdx.x * 2;
+            if (inIdx + 1 < inputElCount * 2) {
+                minVal = input[inIdx + 0];
+                maxVal = input[inIdx + 1];
+            }
+        }
         atomicAdd(&outputSum[0], minVal);
         for (uint i = 16; i >= 1; i /= 2) {
-            minVal = max(__shfl_xor_sync(0xffffffff, minVal, i, 32), minVal);
+            minVal = min(__shfl_xor_sync(0xffffffff, minVal, i, 32), minVal);
             maxVal = max(__shfl_xor_sync(0xffffffff, maxVal, i, 32), maxVal);
         }
-        scratchReduce[0] = minVal;
-        scratchReduce[1] = maxVal;
-        // printf("Thread %d final value = %d\n", threadIdx.x, value);
+        scratchReduce[blockIdx.x * 2 + 0] = minVal;
+        scratchReduce[blockIdx.x * 2 + 1] = maxVal;
     }
 
     __global__ void Conv2D(const float* input, uint sizeX, uint sizeY, uint stride, const float* filter, float* output) {
@@ -35,6 +48,32 @@ namespace Kernels {
         float weighted = input[dtID.y * sizeX + dtID.x];
         // atomicMax(&output[blockIdx.y * gridDim.x + blockIdx.x], weighted);
     }
+}
+
+
+template <class T>
+void Reduce(T* input, T* outputSum, T* scratchReduce, size_t inputElCount) {
+    constexpr size_t GROUPSIZE = 32;
+    size_t prevGc = inputElCount;
+    size_t gc = IntDivideCeil(prevGc, GROUPSIZE);
+    T* scratchA = scratchReduce;
+    const auto offB = CeilToMultipleOf(gc * 2, 32ull);
+    T* scratchB = scratchA + offB;
+    T* stepInput = input;
+    do {
+        if (stepInput == input) {
+            Kernels::MaxReduce<true><<<gc, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
+        } else {
+            Kernels::MaxReduce<false><<<gc, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
+        }
+        stepInput = scratchA;
+        T* temp = scratchA;
+        scratchA = scratchB;
+        scratchB = temp;
+        prevGc = gc;
+        gc = IntDivideCeil(gc, GROUPSIZE);
+    } while (gc > 1);
+    Kernels::MaxReduce<false><<<1, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
 }
 
 int main() {
@@ -70,10 +109,41 @@ int main() {
     //     printf("\n");
     // }
 
+    std::vector<float> array{};
+    array.resize(1024);
+    for (size_t i = 0; i < array.size(); ++i) {
+        array[i] = static_cast<float>(i + 2);
+    }
+
+    float* dArray = nullptr;
+    float* dSums = nullptr;
+    float* dScratch = nullptr;
+
+    cudaMalloc(&dArray, array.size() * sizeof(array[0]));
+    cudaMemcpy(dArray, array.data(), array.size() * sizeof(array[0]), cudaMemcpyHostToDevice);
+
+    cudaMalloc(&dSums, array.size() * sizeof(array[0]));
+    cudaMemset(dSums, 0, array.size() * sizeof(array[0]));
+
+    cudaMalloc(&dScratch, array.size() * sizeof(array[0]));
+    cudaMemset(dScratch, 0, array.size() * sizeof(array[0]));
+
+
     float* dImage = nullptr;
     cudaMalloc(&dImage, width * height * channels * sizeof(float));
 
-    Kernels::MinReduce<<<1, 32>>>();
+    Reduce(dArray, dSums, dScratch, array.size());
+
+    cudaDeviceSynchronize();
+
+    std::vector<float> result{};
+    result.resize(array.size());
+    cudaMemcpy(result.data(), dScratch, result.size() * sizeof(result[0]), cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < array.size(); ++i) {
+        if (i % 32 == 0)
+            printf("\n%lld | ", i / 32);
+        printf("%f ", result[i]);
+    }
 
     return 0;
 }
