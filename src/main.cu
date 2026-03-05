@@ -6,7 +6,7 @@ using uint = uint32_t;
 
 namespace Kernels {
     template<bool FirstPass, class T, T MaxT = std::numeric_limits<T>::max(), T MinT = std::numeric_limits<T>::min()>
-    __global__ void MaxReduce(T* input, T* outputSum, T* scratchReduce, uint inputElCount) {
+    __global__ void MinMaxSumReduce(T* input, T* outputSum, T* scratchReduce, uint inputElCount) {
         T minVal = MaxT;
         T maxVal = MinT;
         if (FirstPass) {
@@ -22,7 +22,9 @@ namespace Kernels {
                 maxVal = input[inIdx + 1];
             }
         }
-        atomicAdd(&outputSum[0], minVal);
+        if (FirstPass) {
+            atomicAdd(&outputSum[0], minVal);
+        }
         for (uint i = 16; i >= 1; i /= 2) {
             minVal = min(__shfl_xor_sync(0xffffffff, minVal, i, 32), minVal);
             maxVal = max(__shfl_xor_sync(0xffffffff, maxVal, i, 32), maxVal);
@@ -62,9 +64,9 @@ void Reduce(T* input, T* outputSum, T* scratchReduce, size_t inputElCount) {
     T* stepInput = input;
     do {
         if (stepInput == input) {
-            Kernels::MaxReduce<true><<<gc, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
+            Kernels::MinMaxSumReduce<true><<<gc, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
         } else {
-            Kernels::MaxReduce<false><<<gc, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
+            Kernels::MinMaxSumReduce<false><<<gc, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
         }
         stepInput = scratchA;
         T* temp = scratchA;
@@ -73,7 +75,7 @@ void Reduce(T* input, T* outputSum, T* scratchReduce, size_t inputElCount) {
         prevGc = gc;
         gc = IntDivideCeil(gc, GROUPSIZE);
     } while (gc > 1);
-    Kernels::MaxReduce<false><<<1, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
+    Kernels::MinMaxSumReduce<false><<<1, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
 }
 
 int main() {
