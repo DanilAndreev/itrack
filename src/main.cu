@@ -1,9 +1,29 @@
 #include "pch.cuh"
 #include <stb_image.h>
 
-namespace Kernels {
-    __global__ void kernel() {
+using uint = uint32_t;
 
+namespace Kernels {
+    __global__ void Conv2D(const float* input, uint sizeX, uint sizeY, uint stride, const float* filter, float* output) {
+        uint2 dtID = {blockIdx.x * (blockDim.x + stride) + threadIdx.x, blockIdx.y * (blockDim.y + stride) + threadIdx.y};
+        if (dtID.x > sizeX && dtID.y < sizeY)
+            return;
+        const uint filterSizeX = blockDim.x;
+        float weighted = input[dtID.y * sizeX + dtID.x] * filter[threadIdx.y * filterSizeX + threadIdx.x];
+        atomicAdd(&output[blockIdx.y * gridDim.x + blockIdx.x], weighted);
+    }
+
+    __global__ void BatchNorm2d() {
+
+    }
+
+    __global__ void MaxPool2D(const float* input, uint sizeX, uint sizeY, uint stride, float* output) {
+        uint2 dtID = {blockIdx.x * (blockDim.x + stride) + threadIdx.x, blockIdx.y * (blockDim.y + stride) + threadIdx.y};
+        if (dtID.x > sizeX && dtID.y < sizeY)
+            return;
+        const uint filterSizeX = blockDim.x;
+        float weighted = input[dtID.y * sizeX + dtID.x];
+        atomicMax(&output[blockIdx.y * gridDim.x + blockIdx.x], weighted);
     }
 }
 
@@ -43,7 +63,7 @@ int main() {
     float* dImage = nullptr;
     cudaMalloc(&dImage, width * height * channels * sizeof(float));
 
-    cudaMemcpy();
+
 
 
     return 0;
