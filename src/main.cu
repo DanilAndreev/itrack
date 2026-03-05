@@ -5,12 +5,17 @@ using uint = uint32_t;
 
 namespace Kernels {
     template<class T>
-    __global__ void MaxReduce(T* input) {
-        T value = input[threadIdx.x];
+    __global__ void MaxReduce(T* input, T* outputSum, T* scratchReduce) {
+        T minVal = input[threadIdx.x];
+        T maxVal = minVal;
+        atomicAdd(&outputSum[0], minVal);
         for (uint i = 16; i >= 1; i /= 2) {
-            value = max(__shfl_xor_sync(0xffffffff, value, i, 32), value);
+            minVal = max(__shfl_xor_sync(0xffffffff, minVal, i, 32), minVal);
+            maxVal = max(__shfl_xor_sync(0xffffffff, maxVal, i, 32), maxVal);
         }
-        printf("Thread %d final value = %d\n", threadIdx.x, value);
+        scratchReduce[0] = minVal;
+        scratchReduce[1] = maxVal;
+        // printf("Thread %d final value = %d\n", threadIdx.x, value);
     }
 
     __global__ void Conv2D(const float* input, uint sizeX, uint sizeY, uint stride, const float* filter, float* output) {
