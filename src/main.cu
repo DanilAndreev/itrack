@@ -93,7 +93,7 @@ namespace Kernels {
 
         uint elIdx = chIdx * (dim.y * dim.x) + elY * dim.x + elX;
         float value = batches[batchIdx][elIdx];
-        constexpr float EPS = 0.00000000001;
+        constexpr float EPS = 0.000001;
         float var = variance[chIdx];
         batches[batchIdx][elIdx] = (value - mean[chIdx]) / sqrt(var + EPS);
     }
@@ -286,12 +286,12 @@ int main() {
 
     if (true) {
         // z = channelsCount
-        constexpr uint3 IMG_DIM = {64, 64, 3};
+        constexpr uint3 IMG_DIM = {64, 64, 1};
         constexpr size_t BATCH_OCCUPANCY_IN_ELS = {IMG_DIM.x * IMG_DIM.y * IMG_DIM.z};
 
         std::vector<float*> batches{};
         batches.emplace_back(static_cast<float*>(malloc(BATCH_OCCUPANCY_IN_ELS * sizeof(float))));
-        batches.emplace_back(static_cast<float*>(malloc(BATCH_OCCUPANCY_IN_ELS * sizeof(float))));
+        // batches.emplace_back(static_cast<float*>(malloc(BATCH_OCCUPANCY_IN_ELS * sizeof(float))));
 
         std::vector<float*> stagingDBatches{};
         stagingDBatches.resize(batches.size());
