@@ -59,6 +59,44 @@ namespace Kernels {
         if (threadIdx.x == 0)
             dst[blockIdx.y * gridDim.x + blockIdx.x] = maxVal;
     }
+
+    __global__ void BatchMean2D(uint batchCount, uint chCount, uint2 dim, float* const* batches, float* outMean) {
+        uint batchTotalElements = batchCount * dim.x * dim.y;
+
+        uint batchIdx = blockIdx.z / chCount;
+        uint chIdx = blockIdx.z % chCount;
+        uint elY = blockIdx.y * blockDim.y + threadIdx.y;
+        uint elX = blockIdx.x * blockDim.x + threadIdx.x;
+
+        float value = batches[batchIdx][chIdx * (dim.y * dim.x) + elY * dim.x + elX];
+        atomicAdd(&outMean[chIdx], value / static_cast<float>(batchTotalElements));
+    }
+
+    __global__ void BatchVariance2D(uint batchCount, uint chCount, uint2 dim, float* const* batches, const float* mean, float* outVariance) {
+        uint batchTotalElements = batchCount * dim.x * dim.y;
+
+        uint batchIdx = blockIdx.z / chCount;
+        uint chIdx = blockIdx.z % chCount;
+        uint elY = blockIdx.y * blockDim.y + threadIdx.y;
+        uint elX = blockIdx.x * blockDim.x + threadIdx.x;
+
+        float value = batches[batchIdx][chIdx * (dim.y * dim.x) + elY * dim.x + elX];
+        float vm = value - mean[chIdx];
+        atomicAdd(&outVariance[chIdx], (vm * vm) / static_cast<float>(batchTotalElements));
+    }
+
+    __global__ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches, const float* variance) {
+        uint batchIdx = blockIdx.z / chCount;
+        uint chIdx = blockIdx.z % chCount;
+        uint elY = blockIdx.y * blockDim.y + threadIdx.y;
+        uint elX = blockIdx.x * blockDim.x + threadIdx.x;
+
+        uint elIdx = chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+        float value = batches[batchIdx][elIdx];
+        float chVariance = variance[chIdx];
+        constexpr float EPS = 0.00000000001;
+        batches[batchIdx][elIdx] = (value - chVariance) / sqrt(chVariance + EPS);
+    }
 }
 
 
@@ -85,6 +123,23 @@ void Reduce(T* input, T* outputSum, T* scratchReduce, size_t inputElCount) {
         gc = IntDivideCeil(gc, GROUPSIZE);
     } while (gc > 1);
     Kernels::MinMaxSumReduce<false><<<1, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
+}
+
+void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches) {
+    //TODO: move outside and reuse
+    float* dScratch;
+    const uint scratchSizeInBytes = chCount * 2 * sizeof(dScratch[0]);
+    cudaMalloc(&dScratch, scratchSizeInBytes);
+    cudaMemset(dScratch, 0, scratchSizeInBytes);
+
+    float* dMean = &dScratch[0];
+    float* dVariance = &dScratch[chCount];
+
+    uint3 groupsize = {8, 8, 1};
+    uint3 gridsize = {IntDivideCeil(dim.x, groupsize.x), IntDivideCeil(dim.y, groupsize.y), batchCount * chCount};
+    Kernels::BatchMean2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dMean);
+    Kernels::BatchVariance2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dMean, dVariance);
+    Kernels::BatchNorm2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dVariance);
 }
 
 void MaxPool2D(float* src, uint2 srcDim, float* dst, uint windowDim, uint stride) {
