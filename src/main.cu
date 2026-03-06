@@ -187,7 +187,7 @@ int main() {
     //     printf("\n");
     // }
 
-    {
+    if (false) {
         const uint WINDOW_DIM = 3;
         const uint STRIDE = 2;
         uint2 tensorDim = {17, 17};
@@ -227,9 +227,8 @@ int main() {
             printf("%f ", result[i]);
         }
     }
-    return 0;
 
-    {
+    if (false) {
         std::vector<float> array{};
         array.resize(1024);
         for (size_t i = 0; i < array.size(); ++i) {
@@ -265,6 +264,55 @@ int main() {
                 printf("\n%lld | ", i / 32);
             printf("%f ", result[i]);
         }
+    }
+
+    if (true) {
+        // z = channelsCount
+        constexpr uint3 IMG_DIM = {64, 64, 3};
+        constexpr size_t BATCH_OCCUPANCY_IN_ELS = {IMG_DIM.x * IMG_DIM.y * IMG_DIM.z};
+
+        std::vector<float*> batches{};
+        batches.emplace_back(static_cast<float*>(malloc(BATCH_OCCUPANCY_IN_ELS * sizeof(float))));
+        batches.emplace_back(static_cast<float*>(malloc(BATCH_OCCUPANCY_IN_ELS * sizeof(float))));
+
+        std::vector<float*> stagingDBatches{};
+        stagingDBatches.resize(batches.size());
+        float** dBatches;
+        cudaMalloc(&dBatches, batches.size() * sizeof(dBatches[0]));
+        for (size_t bIdx = 0; bIdx < batches.size(); ++bIdx) {
+            cudaMalloc(&stagingDBatches[bIdx], BATCH_OCCUPANCY_IN_ELS * sizeof(float));
+            for (size_t chIdx = 0; chIdx < IMG_DIM.z; ++chIdx) {
+                for (size_t y = 0; y < IMG_DIM.y; ++y) {
+                    for (size_t x = 0; x < IMG_DIM.x; ++x) {
+                        batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x] = float(y) / float(x + 1);
+                    }
+                }
+            }
+            cudaMemcpy(stagingDBatches[bIdx], batches[bIdx], BATCH_OCCUPANCY_IN_ELS * sizeof(float), cudaMemcpyHostToDevice);
+        }
+        cudaMemcpy(dBatches, stagingDBatches.data(), stagingDBatches.size() * sizeof(dBatches[0]), cudaMemcpyHostToDevice);
+
+        BatchNorm2D(batches.size(), IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y}, dBatches);
+        cudaDeviceSynchronize();
+
+        printf("\n\n---------------------------------------------------\n");
+
+        for (size_t bIdx = 0; bIdx < batches.size(); ++bIdx) {
+            cudaMemcpy(batches[bIdx], stagingDBatches[bIdx], BATCH_OCCUPANCY_IN_ELS * sizeof(float), cudaMemcpyDeviceToHost);
+
+            printf("\n\n Batch[%lld]:\n", bIdx);
+            for (size_t chIdx = 0; chIdx < IMG_DIM.z; ++chIdx) {
+                printf("\n\n Batch[%lld] Ch[%lld]:\n", bIdx, chIdx);
+                for (size_t y = 0; y < IMG_DIM.y; ++y) {
+                    for (size_t x = 0; x < IMG_DIM.x; ++x) {
+                        batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x] = float(y) / float(x + 1);
+                        printf("%f ", batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x]);
+                    }
+                    printf("\n");
+                }
+            }
+        }
+
     }
 
     return 0;
