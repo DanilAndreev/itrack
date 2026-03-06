@@ -135,10 +135,28 @@ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches) {
     float* dMean = &dScratch[0];
     float* dVariance = &dScratch[chCount];
 
+    std::vector<float> readback{};
+    readback.resize(scratchSizeInBytes / sizeof(float));
+
+
     uint3 groupsize = {8, 8, 1};
     uint3 gridsize = {IntDivideCeil(dim.x, groupsize.x), IntDivideCeil(dim.y, groupsize.y), batchCount * chCount};
     Kernels::BatchMean2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dMean);
+
+    cudaMemcpy(readback.data(), dScratch, scratchSizeInBytes, cudaMemcpyDeviceToHost);
+    printf("\nScratch Mean: ");
+    for (auto v : readback) {
+        printf("%f ", v);
+    }
+
     Kernels::BatchVariance2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dMean, dVariance);
+
+    cudaMemcpy(readback.data(), dScratch, scratchSizeInBytes, cudaMemcpyDeviceToHost);
+    printf("\nScratch Variance: ");
+    for (auto v : readback) {
+        printf("%f ", v);
+    }
+
     Kernels::BatchNorm2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dVariance);
 }
 
@@ -279,12 +297,16 @@ int main() {
         stagingDBatches.resize(batches.size());
         float** dBatches;
         cudaMalloc(&dBatches, batches.size() * sizeof(dBatches[0]));
+
+        bool swtch = false;
         for (size_t bIdx = 0; bIdx < batches.size(); ++bIdx) {
             cudaMalloc(&stagingDBatches[bIdx], BATCH_OCCUPANCY_IN_ELS * sizeof(float));
             for (size_t chIdx = 0; chIdx < IMG_DIM.z; ++chIdx) {
                 for (size_t y = 0; y < IMG_DIM.y; ++y) {
                     for (size_t x = 0; x < IMG_DIM.x; ++x) {
-                        batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x] = float(y) / float(x + 1);
+                        // batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x] = float(y) / float(x + 1);
+                        batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x] = swtch ? 0.5f : 1.0f;
+                        swtch = !swtch;
                     }
                 }
             }
