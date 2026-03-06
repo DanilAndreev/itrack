@@ -85,7 +85,7 @@ namespace Kernels {
         atomicAdd(&outVariance[chIdx], (vm * vm) / static_cast<float>(batchTotalElements));
     }
 
-    __global__ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches, const float* variance) {
+    __global__ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches, const float* mean, const float* variance) {
         uint batchIdx = blockIdx.z / chCount;
         uint chIdx = blockIdx.z % chCount;
         uint elY = blockIdx.y * blockDim.y + threadIdx.y;
@@ -93,9 +93,9 @@ namespace Kernels {
 
         uint elIdx = chIdx * (dim.y * dim.x) + elY * dim.x + elX;
         float value = batches[batchIdx][elIdx];
-        float chVariance = variance[chIdx];
         constexpr float EPS = 0.00000000001;
-        batches[batchIdx][elIdx] = (value - chVariance) / sqrt(chVariance + EPS);
+        float var = variance[chIdx];
+        batches[batchIdx][elIdx] = (value - mean[chIdx]) / sqrt(var + EPS);
     }
 }
 
@@ -157,7 +157,7 @@ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches) {
         printf("%f ", v);
     }
 
-    Kernels::BatchNorm2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dVariance);
+    Kernels::BatchNorm2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dMean, dVariance);
 }
 
 void MaxPool2D(float* src, uint2 srcDim, float* dst, uint windowDim, uint stride) {
