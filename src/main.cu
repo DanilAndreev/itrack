@@ -60,7 +60,7 @@ namespace Kernels {
             dst[blockIdx.y * gridDim.x + blockIdx.x] = maxVal;
     }
 
-    __global__ void BatchMean2D(uint batchCount, uint chCount, uint2 dim, float* const* batches, float* outMean) {
+    __global__ void BatchMean2D(uint batchCount, uint chCount, uint2 dim, const float* tensor, float* outMean) {
         uint batchTotalElements = batchCount * dim.x * dim.y;
 
         uint batchIdx = blockIdx.z / chCount;
@@ -68,11 +68,12 @@ namespace Kernels {
         uint elY = blockIdx.y * blockDim.y + threadIdx.y;
         uint elX = blockIdx.x * blockDim.x + threadIdx.x;
 
-        float value = batches[batchIdx][chIdx * (dim.y * dim.x) + elY * dim.x + elX];
+        const uint linearIdx = batchIdx * (chCount * dim.y * dim.x) + chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+        float value = tensor[linearIdx];
         atomicAdd(&outMean[chIdx], value / static_cast<float>(batchTotalElements));
     }
 
-    __global__ void BatchVariance2D(uint batchCount, uint chCount, uint2 dim, float* const* batches, const float* mean, float* outVariance) {
+    __global__ void BatchVariance2D(uint batchCount, uint chCount, uint2 dim, const float* tensor, const float* mean, float* outVariance) {
         uint batchTotalElements = batchCount * dim.x * dim.y;
 
         uint batchIdx = blockIdx.z / chCount;
@@ -80,22 +81,23 @@ namespace Kernels {
         uint elY = blockIdx.y * blockDim.y + threadIdx.y;
         uint elX = blockIdx.x * blockDim.x + threadIdx.x;
 
-        float value = batches[batchIdx][chIdx * (dim.y * dim.x) + elY * dim.x + elX];
+        const uint linearIdx = batchIdx * (chCount * dim.y * dim.x) + chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+        float value = tensor[linearIdx];
         float vm = value - mean[chIdx];
         atomicAdd(&outVariance[chIdx], (vm * vm) / static_cast<float>(batchTotalElements));
     }
 
-    __global__ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches, const float* mean, const float* variance) {
+    __global__ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float* tensor, const float* mean, const float* variance) {
         uint batchIdx = blockIdx.z / chCount;
         uint chIdx = blockIdx.z % chCount;
         uint elY = blockIdx.y * blockDim.y + threadIdx.y;
         uint elX = blockIdx.x * blockDim.x + threadIdx.x;
 
-        uint elIdx = chIdx * (dim.y * dim.x) + elY * dim.x + elX;
-        float value = batches[batchIdx][elIdx];
-        constexpr float EPS = 0.000001;
+        const uint linearIdx = batchIdx * (chCount * dim.y * dim.x) + chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+        float value = tensor[linearIdx];
+        constexpr float EPS = 1e-5;
         float var = variance[chIdx];
-        batches[batchIdx][elIdx] = (value - mean[chIdx]) / sqrt(var + EPS);
+        tensor[linearIdx] = (value - mean[chIdx]) / sqrt(var + EPS);
     }
 }
 
@@ -125,7 +127,7 @@ void Reduce(T* input, T* outputSum, T* scratchReduce, size_t inputElCount) {
     Kernels::MinMaxSumReduce<false><<<1, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
 }
 
-void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches) {
+void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float* tensor) {
     //TODO: move outside and reuse
     float* dScratch;
     const uint scratchSizeInBytes = chCount * 2 * sizeof(dScratch[0]);
@@ -141,7 +143,7 @@ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches) {
 
     uint3 groupsize = {8, 8, 1};
     uint3 gridsize = {IntDivideCeil(dim.x, groupsize.x), IntDivideCeil(dim.y, groupsize.y), batchCount * chCount};
-    Kernels::BatchMean2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dMean);
+    Kernels::BatchMean2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, tensor, dMean);
 
     cudaMemcpy(readback.data(), dScratch, scratchSizeInBytes, cudaMemcpyDeviceToHost);
     printf("\nScratch Mean: ");
@@ -149,7 +151,7 @@ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches) {
         printf("%f ", v);
     }
 
-    Kernels::BatchVariance2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dMean, dVariance);
+    Kernels::BatchVariance2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, tensor, dMean, dVariance);
 
     cudaMemcpy(readback.data(), dScratch, scratchSizeInBytes, cudaMemcpyDeviceToHost);
     printf("\nScratch Variance: ");
@@ -157,7 +159,7 @@ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float** batches) {
         printf("%f ", v);
     }
 
-    Kernels::BatchNorm2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, batches, dMean, dVariance);
+    Kernels::BatchNorm2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, tensor, dMean, dVariance);
 }
 
 void MaxPool2D(float* src, uint2 srcDim, float* dst, uint windowDim, uint stride) {
@@ -170,6 +172,22 @@ void MaxPool2D(float* src, uint2 srcDim, float* dst, uint windowDim, uint stride
     uint3 gridsize = {(srcDim.x - windowDim) / stride + 1, (srcDim.y - windowDim) / stride + 1, 1};
     uint groupsize = CeilToMultipleOf(windowDim*windowDim, 16u);
     Kernels::MaxPool2DWrp<<<gridsize, groupsize>>>(src, srcDim.x, dst, windowDim, stride);
+}
+
+void Print4D(float* tensor, uint batchCount, uint chCount, uint2 dim) {
+    for (size_t bIdx = 0; bIdx < batchCount; ++bIdx) {
+        printf("\n\n Batch[%lld]:\n", bIdx);
+        for (size_t chIdx = 0; chIdx < chCount; ++chIdx) {
+            printf("\n\n Batch[%lld] Ch[%lld]:\n", bIdx, chIdx);
+            for (size_t y = 0; y < dim.y; ++y) {
+                for (size_t x = 0; x < dim.x; ++x) {
+                    auto idx = bIdx * (chCount * dim.y * dim.x) + chIdx * (dim.y * dim.x) + y * dim.x + x;
+                    printf("%f, ", tensor[idx]);
+                }
+                printf("\n");
+            }
+        }
+    }
 }
 
 int main() {
@@ -286,55 +304,40 @@ int main() {
 
     if (true) {
         // z = channelsCount
-        constexpr uint3 IMG_DIM = {64, 64, 1};
-        constexpr size_t BATCH_OCCUPANCY_IN_ELS = {IMG_DIM.x * IMG_DIM.y * IMG_DIM.z};
+        constexpr uint3 IMG_DIM = {8, 8, 2};
+        constexpr size_t BATCH_COUNT = 1;
+        constexpr size_t BATCH_EL_COUNT = {IMG_DIM.x * IMG_DIM.y * IMG_DIM.z};
 
-        std::vector<float*> batches{};
-        batches.emplace_back(static_cast<float*>(malloc(BATCH_OCCUPANCY_IN_ELS * sizeof(float))));
-        // batches.emplace_back(static_cast<float*>(malloc(BATCH_OCCUPANCY_IN_ELS * sizeof(float))));
+        std::vector<float> tensor{};
+        tensor.resize(BATCH_COUNT * BATCH_EL_COUNT);
 
-        std::vector<float*> stagingDBatches{};
-        stagingDBatches.resize(batches.size());
-        float** dBatches;
-        cudaMalloc(&dBatches, batches.size() * sizeof(dBatches[0]));
+        float* dTensor;
 
-        bool swtch = false;
-        for (size_t bIdx = 0; bIdx < batches.size(); ++bIdx) {
-            cudaMalloc(&stagingDBatches[bIdx], BATCH_OCCUPANCY_IN_ELS * sizeof(float));
+        srand(NULL);
+        for (size_t bIdx = 0; bIdx < BATCH_COUNT; ++bIdx) {
             for (size_t chIdx = 0; chIdx < IMG_DIM.z; ++chIdx) {
                 for (size_t y = 0; y < IMG_DIM.y; ++y) {
                     for (size_t x = 0; x < IMG_DIM.x; ++x) {
-                        // batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x] = float(y) / float(x + 1);
-                        batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x] = swtch ? 0.5f : 1.0f;
-                        swtch = !swtch;
+                        const auto idx = bIdx * (IMG_DIM.z * IMG_DIM.y * IMG_DIM.x) + chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x;
+                        tensor[idx] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
                     }
                 }
             }
-            cudaMemcpy(stagingDBatches[bIdx], batches[bIdx], BATCH_OCCUPANCY_IN_ELS * sizeof(float), cudaMemcpyHostToDevice);
         }
-        cudaMemcpy(dBatches, stagingDBatches.data(), stagingDBatches.size() * sizeof(dBatches[0]), cudaMemcpyHostToDevice);
+        Print4D(tensor.data(), BATCH_COUNT, IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y});
 
-        BatchNorm2D(batches.size(), IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y}, dBatches);
+        cudaMalloc(&dTensor, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float));
+        cudaMemcpy(dTensor, tensor.data(), BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyHostToDevice);
+
+
+        BatchNorm2D(BATCH_COUNT, IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y}, dTensor);
         cudaDeviceSynchronize();
 
         printf("\n\n---------------------------------------------------\n");
 
-        for (size_t bIdx = 0; bIdx < batches.size(); ++bIdx) {
-            cudaMemcpy(batches[bIdx], stagingDBatches[bIdx], BATCH_OCCUPANCY_IN_ELS * sizeof(float), cudaMemcpyDeviceToHost);
 
-            printf("\n\n Batch[%lld]:\n", bIdx);
-            for (size_t chIdx = 0; chIdx < IMG_DIM.z; ++chIdx) {
-                printf("\n\n Batch[%lld] Ch[%lld]:\n", bIdx, chIdx);
-                for (size_t y = 0; y < IMG_DIM.y; ++y) {
-                    for (size_t x = 0; x < IMG_DIM.x; ++x) {
-                        batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x] = float(y) / float(x + 1);
-                        printf("%f ", batches[bIdx][chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x]);
-                    }
-                    printf("\n");
-                }
-            }
-        }
-
+        cudaMemcpy(tensor.data(), dTensor, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyDeviceToHost);
+        Print4D(tensor.data(), BATCH_COUNT, IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y});
     }
 
     return 0;
