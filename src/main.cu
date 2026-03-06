@@ -42,20 +42,29 @@ namespace Kernels {
         atomicAdd(&output[blockIdx.y * gridDim.x + blockIdx.x], weighted);
     }
 
-    __global__ void MaxPool2D(const float* input, uint sizeX, uint sizeY, uint stride, float* output) {
-        uint2 dtID = {blockIdx.x * (blockDim.x + stride) + threadIdx.x, blockIdx.y * (blockDim.y + stride) + threadIdx.y};
-        if (dtID.x > sizeX && dtID.y < sizeY)
-            return;
-        const uint filterSizeX = blockDim.x;
-        float weighted = input[dtID.y * sizeX + dtID.x];
-        // atomicMax(&output[blockIdx.y * gridDim.x + blockIdx.x], weighted);
+    // Naive implementation that underutilizes warp threads. Will be optimized in the future.
+    __global__ void MaxPool2DWrp(const float* src, uint srcDimX, float* dst, uint windowDim, uint stride) {
+        assert(blockDim.x <= warpSize);
+
+        uint2 windowIdx = {threadIdx.x % windowDim, threadIdx.x / windowDim};
+        uint2 srcIdx = {blockIdx.x * stride + windowIdx.x, blockIdx.y * stride + windowIdx.y};
+
+        float maxVal = threadIdx.x < windowDim*windowDim
+                           ? src[srcIdx.y * srcDimX + srcIdx.x]
+                           : FLT_MIN;
+        for (int i = blockDim.x / 2; i >= 1; i /= 2) {
+            maxVal = max(__shfl_xor_sync(0xffffffff, maxVal, i, 32), maxVal);
+        }
+
+        if (threadIdx.x == 0)
+            dst[blockIdx.y * gridDim.x + blockIdx.x] = maxVal;
     }
 }
 
 
 template <class T>
 void Reduce(T* input, T* outputSum, T* scratchReduce, size_t inputElCount) {
-    constexpr size_t GROUPSIZE = 32;
+    constexpr size_t GROUPSIZE = 5;
     size_t prevGc = inputElCount;
     size_t gc = IntDivideCeil(prevGc, GROUPSIZE);
     T* scratchA = scratchReduce;
@@ -76,6 +85,18 @@ void Reduce(T* input, T* outputSum, T* scratchReduce, size_t inputElCount) {
         gc = IntDivideCeil(gc, GROUPSIZE);
     } while (gc > 1);
     Kernels::MinMaxSumReduce<false><<<1, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
+}
+
+void MaxPool2D(float* src, uint2 srcDim, float* dst, uint windowDim, uint stride) {
+    assert(windowDim <= 8 && "Only single warp dimension are supported. (max 32 thr)");
+    assert(srcDim.x >= windowDim);
+    assert((srcDim.x - windowDim) % stride == 0);
+    assert(srcDim.y >= windowDim);
+    assert((srcDim.y - windowDim) % stride == 0);
+
+    uint3 gridsize = {(srcDim.x - windowDim) / stride + 1, (srcDim.y - windowDim) / stride + 1, 1};
+    uint groupsize = CeilToMultipleOf(windowDim*windowDim, 16u);
+    Kernels::MaxPool2DWrp<<<gridsize, groupsize>>>(src, srcDim.x, dst, windowDim, stride);
 }
 
 int main() {
@@ -111,40 +132,84 @@ int main() {
     //     printf("\n");
     // }
 
-    std::vector<float> array{};
-    array.resize(1024);
-    for (size_t i = 0; i < array.size(); ++i) {
-        array[i] = static_cast<float>(i + 2);
+    {
+        const uint WINDOW_DIM = 3;
+        const uint STRIDE = 2;
+        uint2 tensorDim = {17, 17};
+        uint32_t tensorElCount = tensorDim.x * tensorDim.y;
+
+        std::vector<float> tensor{};
+        tensor.resize(tensorElCount);
+        for (size_t i = 0; i < tensorElCount; ++i) {
+            tensor[i] = float(i) + 2;
+
+            if (i % tensorDim.x == 0)
+                printf("\n");
+            printf("%f ", tensor[i]);
+        }
+        printf("\n\n");
+
+        float* dSrcTensor;
+        float* dDstTensor;
+
+        uint2 dstDim = {(tensorDim.x - WINDOW_DIM) / STRIDE + 1, (tensorDim.y - WINDOW_DIM) / STRIDE + 1};
+        uint dstElCount = dstDim.x * dstDim.y;
+        cudaMalloc(&dSrcTensor, tensorElCount * sizeof(float));
+        cudaMalloc(&dDstTensor, dstElCount * sizeof(float));
+        cudaMemcpy(dSrcTensor, tensor.data(), tensorElCount * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemset(dDstTensor, 0, dstElCount * sizeof(float));
+
+        MaxPool2D(dSrcTensor, tensorDim, dDstTensor, WINDOW_DIM, STRIDE);
+
+        cudaDeviceSynchronize();
+
+        std::vector<float> result{};
+        result.resize(dstElCount);
+        cudaMemcpy(result.data(), dDstTensor, dstElCount * sizeof(float), cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < dstElCount; ++i) {
+            if (i % dstDim.x == 0)
+                printf("\n");
+            printf("%f ", result[i]);
+        }
     }
+    return 0;
 
-    float* dArray = nullptr;
-    float* dSums = nullptr;
-    float* dScratch = nullptr;
+    {
+        std::vector<float> array{};
+        array.resize(1024);
+        for (size_t i = 0; i < array.size(); ++i) {
+            array[i] = static_cast<float>(i + 2);
+        }
 
-    cudaMalloc(&dArray, array.size() * sizeof(array[0]));
-    cudaMemcpy(dArray, array.data(), array.size() * sizeof(array[0]), cudaMemcpyHostToDevice);
+        float* dArray = nullptr;
+        float* dSums = nullptr;
+        float* dScratch = nullptr;
 
-    cudaMalloc(&dSums, array.size() * sizeof(array[0]));
-    cudaMemset(dSums, 0, array.size() * sizeof(array[0]));
+        cudaMalloc(&dArray, array.size() * sizeof(array[0]));
+        cudaMemcpy(dArray, array.data(), array.size() * sizeof(array[0]), cudaMemcpyHostToDevice);
 
-    cudaMalloc(&dScratch, array.size() * sizeof(array[0]));
-    cudaMemset(dScratch, 0, array.size() * sizeof(array[0]));
+        cudaMalloc(&dSums, array.size() * sizeof(array[0]));
+        cudaMemset(dSums, 0, array.size() * sizeof(array[0]));
+
+        cudaMalloc(&dScratch, array.size() * sizeof(array[0]));
+        cudaMemset(dScratch, 0, array.size() * sizeof(array[0]));
 
 
-    float* dImage = nullptr;
-    cudaMalloc(&dImage, width * height * channels * sizeof(float));
+        float* dImage = nullptr;
+        cudaMalloc(&dImage, width * height * channels * sizeof(float));
 
-    Reduce(dArray, dSums, dScratch, array.size());
+        Reduce(dArray, dSums, dScratch, array.size());
 
-    cudaDeviceSynchronize();
+        cudaDeviceSynchronize();
 
-    std::vector<float> result{};
-    result.resize(array.size());
-    cudaMemcpy(result.data(), dScratch, result.size() * sizeof(result[0]), cudaMemcpyDeviceToHost);
-    for (size_t i = 0; i < array.size(); ++i) {
-        if (i % 32 == 0)
-            printf("\n%lld | ", i / 32);
-        printf("%f ", result[i]);
+        std::vector<float> result{};
+        result.resize(array.size());
+        cudaMemcpy(result.data(), dScratch, result.size() * sizeof(result[0]), cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < array.size(); ++i) {
+            if (i % 32 == 0)
+                printf("\n%lld | ", i / 32);
+            printf("%f ", result[i]);
+        }
     }
 
     return 0;
