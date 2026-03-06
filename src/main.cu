@@ -42,7 +42,7 @@ namespace Kernels {
         atomicAdd(&output[blockIdx.y * gridDim.x + blockIdx.x], weighted);
     }
 
-    // Naive implementation that underutilizes warp threads. Will be optimized in the future.
+    // Naive implementation that underutilizes warp threads and has unoptimal memory pattern. Will be optimized in the future.
     __global__ void MaxPool2DWrp(const float* src, uint srcDimX, float* dst, uint windowDim, uint stride) {
         assert(blockDim.x <= warpSize);
 
