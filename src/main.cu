@@ -33,13 +33,22 @@ namespace Kernels {
         scratchReduce[blockIdx.x * 2 + 1] = maxVal;
     }
 
-    __global__ void Conv2D(const float* input, uint sizeX, uint sizeY, uint stride, const float* filter, float* output) {
-        uint2 dtID = {blockIdx.x * (blockDim.x + stride) + threadIdx.x, blockIdx.y * (blockDim.y + stride) + threadIdx.y};
-        if (dtID.x > sizeX && dtID.y < sizeY)
-            return;
+    __global__ void Conv2D(uint batchCount, uint chCount, uint2 dim, uint stride, const float* filter, const float* srcTensor, float* dstTensor) {
+        // uint2 dtID = {blockIdx.x * (blockDim.x + stride) + threadIdx.x, blockIdx.y * (blockDim.y + stride) + threadIdx.y};
+
+        //TODO: add filterCount dimension
+
+        uint batchIdx = blockIdx.z / chCount;
+        uint chIdx = blockIdx.z % chCount;
+        uint elY = blockIdx.y * stride + threadIdx.y;
+        uint elX = blockIdx.x * stride + threadIdx.x;
+
+
+        const uint linearIdx = batchIdx * (chCount * dim.y * dim.x) + chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+
         const uint filterSizeX = blockDim.x;
-        float weighted = input[dtID.y * sizeX + dtID.x] * filter[threadIdx.y * filterSizeX + threadIdx.x];
-        atomicAdd(&output[blockIdx.y * gridDim.x + blockIdx.x], weighted);
+        float weighted = srcTensor[linearIdx] * filter[threadIdx.y * filterSizeX + threadIdx.x];
+        atomicAdd(&dstTensor[batchIdx * (gridDim.x * gridDim.y) + blockIdx.y * gridDim.x + blockIdx.x], weighted);
     }
 
     // Naive implementation that underutilizes warp threads and has unoptimal memory pattern. Will be optimized in the future.
