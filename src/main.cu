@@ -33,22 +33,23 @@ namespace Kernels {
         scratchReduce[blockIdx.x * 2 + 1] = maxVal;
     }
 
-    __global__ void Conv2D(uint batchCount, uint chCount, uint2 dim, uint stride, const float* filter, const float* srcTensor, float* dstTensor) {
-        // uint2 dtID = {blockIdx.x * (blockDim.x + stride) + threadIdx.x, blockIdx.y * (blockDim.y + stride) + threadIdx.y};
-
-        //TODO: add filterCount dimension
-
-        uint batchIdx = blockIdx.z / chCount;
+    //TODO: Naive implementation. Currently it wastes a lot of lanes per warp. Will be optimized later.
+    __global__ void Conv2D(uint chCount, uint2 dim, uint stride, const float* filter, const float* srcTensor, float* dstTensor) {
+        uint filterIdx = blockIdx.z / chCount;
         uint chIdx = blockIdx.z % chCount;
         uint elY = blockIdx.y * stride + threadIdx.y;
         uint elX = blockIdx.x * stride + threadIdx.x;
 
 
-        const uint linearIdx = batchIdx * (chCount * dim.y * dim.x) + chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+        const uint linearIdx = filterIdx * (chCount * dim.y * dim.x) + chIdx * (dim.y * dim.x) + elY * dim.x + elX;
 
-        const uint filterSizeX = blockDim.x;
-        float weighted = srcTensor[linearIdx] * filter[threadIdx.y * filterSizeX + threadIdx.x];
-        atomicAdd(&dstTensor[batchIdx * (gridDim.x * gridDim.y) + blockIdx.y * gridDim.x + blockIdx.x], weighted);
+        const uint filterSize = blockDim.x;
+        assert(blockDim.x == blockDim.y);
+
+        const uint filterLinearIdx = filterIdx * (chCount*filterSize*filterSize) + chIdx * (filterSize*filterSize) + threadIdx.y * filterSize + threadIdx.x;
+        const float filterVal = filter[filterLinearIdx];
+        float weighted = srcTensor[linearIdx] * filterVal;
+        atomicAdd(&dstTensor[filterIdx * (gridDim.x * gridDim.y) + blockIdx.y * gridDim.x + blockIdx.x], weighted);
     }
 
     // Naive implementation that underutilizes warp threads and has unoptimal memory pattern. Will be optimized in the future.
@@ -232,6 +233,51 @@ int main() {
     //     printf("\n");
     // }
 
+    if (true) {
+        // z = channelsCount
+        constexpr uint3 IMG_DIM = {8, 8, 1};
+        constexpr size_t BATCH_COUNT = 1;
+        constexpr size_t FILTER_COUNT = 1;
+        constexpr size_t SINGLE_FILTER_EL_COUNT = IMG_DIM.x * IMG_DIM.y * IMG_DIM.z;
+        constexpr size_t BATCH_EL_COUNT = IMG_DIM.x * IMG_DIM.y * IMG_DIM.z;
+
+        std::vector<float> tensor{};
+        tensor.resize(BATCH_COUNT * BATCH_EL_COUNT);
+
+        std::vector<float> filters{};
+        filters.
+
+
+        float* dTensor;
+
+        srand(NULL);
+        for (size_t bIdx = 0; bIdx < BATCH_COUNT; ++bIdx) {
+            for (size_t chIdx = 0; chIdx < IMG_DIM.z; ++chIdx) {
+                for (size_t y = 0; y < IMG_DIM.y; ++y) {
+                    for (size_t x = 0; x < IMG_DIM.x; ++x) {
+                        const auto idx = bIdx * (IMG_DIM.z * IMG_DIM.y * IMG_DIM.x) + chIdx * (IMG_DIM.y * IMG_DIM.x) + y * IMG_DIM.x + x;
+                        tensor[idx] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+                    }
+                }
+            }
+        }
+        Print4D(tensor.data(), BATCH_COUNT, IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y});
+
+        cudaMalloc(&dTensor, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float));
+        cudaMemcpy(dTensor, tensor.data(), BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyHostToDevice);
+
+
+        Kernels::Conv2D<<<>>>();
+        // BatchNorm2D(BATCH_COUNT, IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y}, dTensor);
+        cudaDeviceSynchronize();
+
+        printf("\n\n---------------------------------------------------\n");
+
+
+        cudaMemcpy(tensor.data(), dTensor, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyDeviceToHost);
+        Print4D(tensor.data(), BATCH_COUNT, IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y});
+    }
+
     if (false) {
         const uint WINDOW_DIM = 3;
         const uint STRIDE = 2;
@@ -311,10 +357,11 @@ int main() {
         }
     }
 
-    if (true) {
+    if (false) {
         // z = channelsCount
         constexpr uint3 IMG_DIM = {8, 8, 2};
         constexpr size_t BATCH_COUNT = 1;
+        //TODO: wrong. swap IMG_DIM.z and BATCH_COUNT;
         constexpr size_t BATCH_EL_COUNT = {IMG_DIM.x * IMG_DIM.y * IMG_DIM.z};
 
         std::vector<float> tensor{};
