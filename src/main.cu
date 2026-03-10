@@ -53,21 +53,26 @@ namespace Kernels {
     }
 
     // Naive implementation that underutilizes warp threads and has unoptimal memory pattern. Will be optimized in the future.
-    __global__ void MaxPool2DWrp(const float* src, uint srcDimX, float* dst, uint windowDim, uint stride) {
+    __global__ void MaxPool2DWrp(uint chCount, uint2 dim, uint windowSize, uint stride, float* srcTensor, float* dstTensor) {
         assert(blockDim.x <= warpSize);
+        // uint batchIdx = blockIdx.z / chCount;
+        uint chIdx = blockIdx.z % chCount;
 
-        uint2 windowIdx = {threadIdx.x % windowDim, threadIdx.x / windowDim};
-        uint2 srcIdx = {blockIdx.x * stride + windowIdx.x, blockIdx.y * stride + windowIdx.y};
+        uint2 windowIdx = {threadIdx.x % windowSize, threadIdx.x / windowSize};
+        uint elY = blockIdx.y * stride + windowIdx.x;
+        uint elX = blockIdx.x * stride + windowIdx.y;
 
-        float maxVal = threadIdx.x < windowDim*windowDim
-                           ? src[srcIdx.y * srcDimX + srcIdx.x]
+        uint linearIdx = chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+
+        float maxVal = threadIdx.x < windowSize*windowSize
+                           ? srcTensor[linearIdx]
                            : FLT_MIN;
         for (int i = blockDim.x / 2; i >= 1; i /= 2) {
             maxVal = max(__shfl_xor_sync(0xffffffff, maxVal, i, 32), maxVal);
         }
 
         if (threadIdx.x == 0)
-            dst[blockIdx.y * gridDim.x + blockIdx.x] = maxVal;
+            dstTensor[chIdx * (gridDim.x * gridDim.y) + blockIdx.y * gridDim.x + blockIdx.x] = maxVal;
     }
 
     __global__ void BatchMean2D(uint batchCount, uint chCount, uint2 dim, const float* tensor, float* outMean) {
@@ -172,16 +177,17 @@ void BatchNorm2D(uint batchCount, uint chCount, uint2 dim, float* tensor) {
     Kernels::BatchNorm2D<<<gridsize, groupsize>>>(batchCount, chCount, dim, tensor, dMean, dVariance);
 }
 
-void MaxPool2D(float* src, uint2 srcDim, float* dst, uint windowDim, uint stride) {
-    assert(windowDim <= 8 && "Only single warp dimension are supported. (max 32 thr)");
-    assert(srcDim.x >= windowDim);
-    assert((srcDim.x - windowDim) % stride == 0);
-    assert(srcDim.y >= windowDim);
-    assert((srcDim.y - windowDim) % stride == 0);
+// void MaxPool2D(float* src, uint2 srcDim, float* dst, uint windowDim, uint stride) {
+void MaxPool2D(uint chCount, uint2 dim, uint windowSize, uint stride, float* srcTensor, float* dstTensor) {
+    assert(windowSize <= 8 && "Only single warp dimension are supported. (max 32 thr)");
+    assert(dim.x >= windowSize);
+    assert((dim.x - windowSize) % stride == 0);
+    assert(dim.y >= windowSize);
+    assert((dim.y - windowSize) % stride == 0);
 
-    uint3 gridsize = {(srcDim.x - windowDim) / stride + 1, (srcDim.y - windowDim) / stride + 1, 1};
-    uint groupsize = CeilToMultipleOf(windowDim*windowDim, 16u);
-    Kernels::MaxPool2DWrp<<<gridsize, groupsize>>>(src, srcDim.x, dst, windowDim, stride);
+    uint3 gridsize = {(dim.x - windowSize) / stride + 1, (dim.y - windowSize) / stride + 1, chCount};
+    uint groupsize = CeilToMultipleOf(windowSize*windowSize, 16u);
+    Kernels::MaxPool2DWrp<<<gridsize, groupsize>>>(chCount, dim, windowSize, stride, srcTensor, dstTensor);
 }
 
 void Print4D(float* tensor, uint batchCount, uint chCount, uint2 dim) {
@@ -234,7 +240,7 @@ int main() {
     // }
 
 
-    if (true) {
+    if (false) {
         // z = channelsCount
         constexpr uint3 IMG_DIM = {7, 7, 2};
         constexpr size_t BATCH_COUNT = 1;
@@ -305,7 +311,7 @@ int main() {
         cudaMemcpy(tensor.data(), dRes, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyDeviceToHost);
         Print4D(tensor.data(), BATCH_COUNT, FILTER_COUNT, {gridsize.x, gridsize.y});
     }
-    if (false) {
+    if (true) {
         const uint WINDOW_DIM = 3;
         const uint STRIDE = 2;
         uint2 tensorDim = {17, 17};
@@ -332,7 +338,7 @@ int main() {
         cudaMemcpy(dSrcTensor, tensor.data(), tensorElCount * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemset(dDstTensor, 0, dstElCount * sizeof(float));
 
-        MaxPool2D(dSrcTensor, tensorDim, dDstTensor, WINDOW_DIM, STRIDE);
+        MaxPool2D(1, tensorDim, WINDOW_DIM, STRIDE, dSrcTensor, dDstTensor);
 
         cudaDeviceSynchronize();
 
