@@ -17,3 +17,9 @@ constexpr auto IntDivideCeil(T intValue, T factor) noexcept
 }
 
 using uint = uint32_t;
+
+#ifdef _DEBUG
+#define SUCC(expr) assert((expr) == cudaSuccess);
+#else
+#define SUCC(expr) expr;
+#endif

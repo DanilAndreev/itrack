@@ -87,14 +87,15 @@ namespace Kernels {
 }
 
 namespace Layers {
-    void Conv2D(uint4 dim, uint filterSize, uint stride, uint filterCount, const float* filter, const float* srcTensor, float* dstTensor) {
+    uint4 Conv2D(uint4 dim, uint filterSize, uint stride, uint filterCount, const float* filter, const float* srcTensor, float* dstTensor) {
         uint3 gridsize = {dim.x / stride, dim.y / stride , dim.z * filterCount};
         uint3 groupsize = {filterSize, filterSize, 1};
 
         Kernels::Conv2D<<<gridsize, groupsize>>>(dim, stride, filter, srcTensor, dstTensor);
+        return {gridsize.x, gridsize.y, filterCount, dim.w};
     }
 
-    void MaxPool2D(uint4 dim, uint windowSize, uint stride, float* srcTensor, float* dstTensor) {
+    uint4 MaxPool2D(uint4 dim, uint windowSize, uint stride, float* srcTensor, float* dstTensor) {
         assert(windowSize <= 8 && "Only single warp dimension are supported. (max 32 thr)");
         assert(dim.x >= windowSize);
         assert((dim.x - windowSize) % stride == 0);
@@ -104,6 +105,7 @@ namespace Layers {
         uint3 gridsize = {(dim.x - windowSize) / stride + 1, (dim.y - windowSize) / stride + 1, dim.z};
         uint groupsize = CeilToMultipleOf(windowSize*windowSize, 16u);
         Kernels::MaxPool2DWrp<<<gridsize, groupsize>>>(dim, windowSize, stride, srcTensor, dstTensor);
+        return {gridsize.x, gridsize.y, dim.z, dim.w};
     }
 
     void BatchNorm2D(uint4 dim, float* tensor) {

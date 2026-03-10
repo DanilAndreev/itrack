@@ -2,6 +2,27 @@
 #include <stb_image.h>
 #include "LayerKernels.cuh"
 
+float* DeviceAllocAndFillFilter(uint filterSize, uint chCount, uint filterCount) noexcept {
+    std::vector<float> staging{};
+    staging.resize(filterCount * chCount * filterSize * filterSize);
+
+    float *dFilter;
+    cudaMalloc(&dFilter, staging.size() * sizeof(float));
+
+    for (size_t fIdx = 0; fIdx < filterSize; ++fIdx) {
+        for (size_t chIdx = 0; chIdx < filterSize; ++chIdx) {
+            for (size_t y = 0; y < filterSize; ++y) {
+                for (size_t x = 0; x < filterSize; ++x) {
+                    auto idx = fIdx * (chCount*filterSize*filterSize) + chIdx * (filterSize*filterSize) + y * filterSize + x;
+                    staging[idx] = 1.0f;
+                }
+            }
+        }
+    }
+    cudaMemcpy(dFilter, staging.data(), staging.size() * sizeof(float), cudaMemcpyHostToDevice);
+    return dFilter;
+}
+
 int main() {
     std::cout << "Hello, World!" << std::endl;
 
@@ -35,30 +56,46 @@ int main() {
         printf("\n");
     }
 
+    constexpr uint L0_FILTER_COUNT = 96;
+
     // width, height, chCount, batchCount
-    uint4 tensorDim{ static_cast<uint>(width), static_cast<uint>(height), static_cast<uint>(channels), 1};
+    uint4 tDim{ static_cast<uint>(width), static_cast<uint>(height), static_cast<uint>(channels), 1};
 
     std::vector<float> tensorStaging{};
-    tensorStaging.resize(tensorDim.x * tensorDim.y * tensorDim.z * tensorDim.w);
-    assert(tensorDim.w == 1 && "Batches are not fully supported yet");
-    for (size_t y = 0; y < tensorDim.y; ++y) {
-        for (size_t x = 0; x < tensorDim.x; ++x) {
-            for (size_t chIdx = 0; chIdx < tensorDim.z; ++chIdx) {
-                unsigned char v = img[(y * tensorDim.x + x) * channels + chIdx];
-                tensorStaging[chIdx * tensorDim.x * tensorDim.y + y * tensorDim.x + x] = static_cast<float>(v) / 255.0f;
+    tensorStaging.resize(tDim.x * tDim.y * tDim.z * tDim.w);
+    assert(tDim.w == 1 && "Batches are not fully supported yet");
+    for (size_t y = 0; y < tDim.y; ++y) {
+        for (size_t x = 0; x < tDim.x; ++x) {
+            for (size_t chIdx = 0; chIdx < tDim.z; ++chIdx) {
+                unsigned char v = img[(y * tDim.x + x) * channels + chIdx];
+                tensorStaging[chIdx * tDim.x * tDim.y + y * tDim.x + x] = static_cast<float>(v) / 255.0f;
             }
         }
     }
 
-    float* dInputTensor;
+    float* dTensorMemA;
+    float* dTensorMemB;
 
-    cudaMalloc(&dInputTensor, tensorDim.x * tensorDim.y * tensorDim.z * tensorDim.w);
-    cudaMemcpy(dInputTensor, tensorStaging.data(), tensorStaging.size() * sizeof(float), cudaMemcpyHostToDevice);
+    float* dFilterWL0;
 
+    assert(tDim.w == 1);
 
-    Layers::Conv2D(tensorDim, 11, 2, c, dFilterL0, dInputTensor, dDst);
-    Layers::BatchNorm2D(outDim, dDst);
-    Layers::MaxPool2D(outDim, 3, 2, dDst, dDst2);
+    const auto TMP_MEM_EL = tDim.x * tDim.y * 384;
+    SUCC(cudaMalloc(&dTensorMemA, TMP_MEM_EL * sizeof(float)));
+    SUCC(cudaMalloc(&dTensorMemB, TMP_MEM_EL * sizeof(float)));
+
+    cudaMemcpy(dTensorMemA, tensorStaging.data(), tensorStaging.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(dTensorMemB, 0, tDim.x * tDim.y * 384 * sizeof(float));
+
+    cudaMalloc(&dFilterWL0, L0_FILTER_COUNT * tDim.z * 11 * 11 * sizeof(float));
+
+    dFilterWL0 = DeviceAllocAndFillFilter(11, tDim.z, L0_FILTER_COUNT);
+    tDim = Layers::Conv2D(tDim, 11, 2, L0_FILTER_COUNT, dFilterWL0, dTensorMemA, dTensorMemB);
+    cudaMemset(dTensorMemA, 0, TMP_MEM_EL * sizeof(float));
+    Layers::BatchNorm2D(tDim, dTensorMemB);
+    tDim = Layers::MaxPool2D(tDim, 3, 2, dTensorMemB, dTensorMemA);
+    cudaMemset(dTensorMemB, 0, TMP_MEM_EL * sizeof(float));
+
     // Layers::ReLU();
 
     return 0;
