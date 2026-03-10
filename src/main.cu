@@ -233,16 +233,17 @@ int main() {
     //     printf("\n");
     // }
 
+
     if (true) {
         // z = channelsCount
-        constexpr uint3 IMG_DIM = {7, 7, 1};
+        constexpr uint3 IMG_DIM = {7, 7, 2};
         constexpr size_t BATCH_COUNT = 1;
         constexpr size_t FILTER_COUNT = 1;
         constexpr size_t SINGLE_FILTER_EL_COUNT = IMG_DIM.x * IMG_DIM.y * IMG_DIM.z;
         constexpr size_t BATCH_EL_COUNT = IMG_DIM.x * IMG_DIM.y * IMG_DIM.z;
 
-        constexpr size_t FILTER_SIZE = 3;
-        constexpr size_t FILTER_STRIDE = 2;
+        constexpr size_t FILTER_SIZE = 2;
+        constexpr size_t FILTER_STRIDE = 1;
 
         std::vector<float> tensor{};
         tensor.resize(BATCH_COUNT * BATCH_EL_COUNT);
@@ -253,12 +254,16 @@ int main() {
             for (size_t chIdx = 0; chIdx < IMG_DIM.z; ++chIdx) {
                 for (size_t y = 0; y < FILTER_SIZE; ++y) {
                     for (size_t x = 0; x < FILTER_SIZE; ++x) {
-                        auto idx = fIdx * (IMG_DIM.z * FILTER_SIZE * FILTER_SIZE) + chIdx * (FILTER_SIZE * FILTER_SIZE) + y * FILTER_SIZE * x;
+                        auto idx = fIdx * (IMG_DIM.z * FILTER_SIZE * FILTER_SIZE) + chIdx * (FILTER_SIZE * FILTER_SIZE) + y * FILTER_SIZE + x;
                         filters[idx] = 1;
                     }
                 }
             }
         }
+
+        printf("Filters:");
+        Print4D(filters.data(), BATCH_COUNT, FILTER_COUNT, {FILTER_SIZE, FILTER_SIZE});
+
 
         float* dFilters;
         float* dTensor;
@@ -298,9 +303,8 @@ int main() {
 
 
         cudaMemcpy(tensor.data(), dRes, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyDeviceToHost);
-        Print4D(tensor.data(), BATCH_COUNT, IMG_DIM.z, {gridsize.x, gridsize.y});
+        Print4D(tensor.data(), BATCH_COUNT, FILTER_COUNT, {gridsize.x, gridsize.y});
     }
-
     if (false) {
         const uint WINDOW_DIM = 3;
         const uint STRIDE = 2;
