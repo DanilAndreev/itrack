@@ -64,6 +64,7 @@ namespace Layers {
         Kernels::MinMaxSumReduce<false><<<1, GROUPSIZE>>>(stepInput, outputSum, scratchA, prevGc);
     }
 
+    void ReLU(uint4 dim, float* tensor);
     uint4 Conv2D(uint4 dim, uint filterSize, uint stride, uint filterCount, const float* filter, const float* srcTensor, float* dstTensor);
     uint4 MaxPool2D(uint4 dim, uint windowSize, uint stride, float* srcTensor, float* dstTensor);
     void BatchNorm2D(uint4 dim, float* tensor);

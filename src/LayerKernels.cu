@@ -2,6 +2,19 @@
 #include "LayerKernels.cuh"
 
 namespace Kernels {
+    __global__ void ReLU(uint4 dim, float* tensor) {
+        uint batchIdx = blockIdx.z / dim.z;
+        uint chIdx = blockIdx.z % dim.z;
+        uint elY = blockIdx.y * blockDim.y + threadIdx.y;
+        uint elX = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if (elX >= dim.x || elY >= dim.y)
+            return;
+
+        const uint linearIdx = batchIdx * (dim.z * dim.y * dim.x) + chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+        float value = tensor[linearIdx];
+        tensor[linearIdx] = value > 0.0f ? value : 0.0f;
+    }
 
     //TODO: Naive implementation. Currently it wastes a lot of lanes per warp. Will be optimized later.
     __global__ void Conv2D(uint4 dim, uint stride, const float* filter, const float* srcTensor, float* dstTensor) {
@@ -11,14 +24,14 @@ namespace Kernels {
         uint elX = blockIdx.x * stride + threadIdx.x;
 
 
-        const uint linearIdx = filterIdx * (dim.z * dim.y * dim.x) + chIdx * (dim.y * dim.x) + elY * dim.x + elX;
+        const uint srcLinearIdx = chIdx * (dim.y * dim.x) + elY * dim.x + elX;
 
         const uint filterSize = blockDim.x;
         assert(blockDim.x == blockDim.y);
 
         const uint filterLinearIdx = filterIdx * (dim.z*filterSize*filterSize) + chIdx * (filterSize*filterSize) + threadIdx.y * filterSize + threadIdx.x;
         const float filterVal = filter[filterLinearIdx];
-        float weighted = srcTensor[linearIdx] * filterVal;
+        float weighted = srcTensor[srcLinearIdx] * filterVal;
         atomicAdd(&dstTensor[filterIdx * (gridDim.x * gridDim.y) + blockIdx.y * gridDim.x + blockIdx.x], weighted);
     }
 
@@ -87,9 +100,15 @@ namespace Kernels {
 }
 
 namespace Layers {
+    void ReLU(uint4 dim, float* tensor) {
+        uint3 groupsize = {8, 8, 1};
+        uint3 gridsize = {IntDivideCeil(dim.x, groupsize.x), IntDivideCeil(dim.y, groupsize.y), dim.z * dim.w};
+        Kernels::ReLU<<<gridsize, groupsize>>>(dim, tensor);
+    }
+
     uint4 Conv2D(uint4 dim, uint filterSize, uint stride, uint filterCount, const float* filter, const float* srcTensor, float* dstTensor) {
-        uint3 gridsize = {dim.x / stride, dim.y / stride , dim.z * filterCount};
         uint3 groupsize = {filterSize, filterSize, 1};
+        uint3 gridsize = {dim.x / stride, dim.y / stride , dim.z * filterCount};
 
         Kernels::Conv2D<<<gridsize, groupsize>>>(dim, stride, filter, srcTensor, dstTensor);
         return {gridsize.x, gridsize.y, filterCount, dim.w};
@@ -102,8 +121,8 @@ namespace Layers {
         assert(dim.y >= windowSize);
         assert((dim.y - windowSize) % stride == 0);
 
-        uint3 gridsize = {(dim.x - windowSize) / stride + 1, (dim.y - windowSize) / stride + 1, dim.z};
         uint groupsize = CeilToMultipleOf(windowSize*windowSize, 16u);
+        uint3 gridsize = {(dim.x - windowSize) / stride + 1, (dim.y - windowSize) / stride + 1, dim.z};
         Kernels::MaxPool2DWrp<<<gridsize, groupsize>>>(dim, windowSize, stride, srcTensor, dstTensor);
         return {gridsize.x, gridsize.y, dim.z, dim.w};
     }

@@ -26,8 +26,9 @@ float* DeviceAllocAndFillFilter(uint filterSize, uint chCount, uint filterCount)
 int main() {
     std::cout << "Hello, World!" << std::endl;
 
-    int width, height, channels;
-    unsigned char *img = stbi_load("dataset/cat.png", &width, &height, &channels, 0);
+    int channels = 3;
+    int width, height, chInFile;
+    unsigned char *img = stbi_load("dataset/search.png", &width, &height, &chInFile, channels);
     if (img == NULL) {
         printf("Error in loading the image\n");
         exit(1);
@@ -95,8 +96,8 @@ int main() {
     Layers::BatchNorm2D(tDim, dTensorMemB);
     tDim = Layers::MaxPool2D(tDim, 3, 2, dTensorMemB, dTensorMemA);
     cudaMemset(dTensorMemB, 0, TMP_MEM_EL * sizeof(float));
-
-    // Layers::ReLU();
+    Layers::ReLU(tDim, dTensorMemA);
+    Utils::ReadbackAndPrint4D(dTensorMemA, tDim);
 
     return 0;
 }
