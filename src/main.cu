@@ -235,20 +235,34 @@ int main() {
 
     if (true) {
         // z = channelsCount
-        constexpr uint3 IMG_DIM = {8, 8, 1};
+        constexpr uint3 IMG_DIM = {7, 7, 1};
         constexpr size_t BATCH_COUNT = 1;
         constexpr size_t FILTER_COUNT = 1;
         constexpr size_t SINGLE_FILTER_EL_COUNT = IMG_DIM.x * IMG_DIM.y * IMG_DIM.z;
         constexpr size_t BATCH_EL_COUNT = IMG_DIM.x * IMG_DIM.y * IMG_DIM.z;
 
+        constexpr size_t FILTER_SIZE = 3;
+        constexpr size_t FILTER_STRIDE = 2;
+
         std::vector<float> tensor{};
         tensor.resize(BATCH_COUNT * BATCH_EL_COUNT);
 
         std::vector<float> filters{};
-        filters.
+        filters.resize(FILTER_COUNT * SINGLE_FILTER_EL_COUNT);
+        for (size_t fIdx = 0; fIdx < FILTER_COUNT; ++fIdx) {
+            for (size_t chIdx = 0; chIdx < IMG_DIM.z; ++chIdx) {
+                for (size_t y = 0; y < FILTER_SIZE; ++y) {
+                    for (size_t x = 0; x < FILTER_SIZE; ++x) {
+                        auto idx = fIdx * (IMG_DIM.z * FILTER_SIZE * FILTER_SIZE) + chIdx * (FILTER_SIZE * FILTER_SIZE) + y * FILTER_SIZE * x;
+                        filters[idx] = 1;
+                    }
+                }
+            }
+        }
 
-
+        float* dFilters;
         float* dTensor;
+        float* dRes;
 
         srand(NULL);
         for (size_t bIdx = 0; bIdx < BATCH_COUNT; ++bIdx) {
@@ -266,16 +280,25 @@ int main() {
         cudaMalloc(&dTensor, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float));
         cudaMemcpy(dTensor, tensor.data(), BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyHostToDevice);
 
+        cudaMalloc(&dFilters, FILTER_COUNT * SINGLE_FILTER_EL_COUNT * sizeof(float));
+        cudaMemcpy(dFilters, filters.data(), FILTER_COUNT * SINGLE_FILTER_EL_COUNT * sizeof(float), cudaMemcpyHostToDevice);
 
-        Kernels::Conv2D<<<>>>();
-        // BatchNorm2D(BATCH_COUNT, IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y}, dTensor);
+        cudaMalloc(&dRes, FILTER_COUNT * SINGLE_FILTER_EL_COUNT * sizeof(float));
+        cudaMemset(dRes, 0, FILTER_COUNT * SINGLE_FILTER_EL_COUNT * sizeof(float));
+
+
+
+        uint3 gridsize = {IMG_DIM.x / FILTER_STRIDE, IMG_DIM.y / FILTER_STRIDE , IMG_DIM.x * FILTER_COUNT};
+        uint3 groupsize = {FILTER_SIZE, FILTER_SIZE, 1};
+
+        Kernels::Conv2D<<<gridsize, groupsize>>>(IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y}, FILTER_STRIDE, dFilters, dTensor, dRes);
         cudaDeviceSynchronize();
 
         printf("\n\n---------------------------------------------------\n");
 
 
-        cudaMemcpy(tensor.data(), dTensor, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyDeviceToHost);
-        Print4D(tensor.data(), BATCH_COUNT, IMG_DIM.z, {IMG_DIM.x, IMG_DIM.y});
+        cudaMemcpy(tensor.data(), dRes, BATCH_COUNT * BATCH_EL_COUNT * sizeof(float), cudaMemcpyDeviceToHost);
+        Print4D(tensor.data(), BATCH_COUNT, IMG_DIM.z, {gridsize.x, gridsize.y});
     }
 
     if (false) {
