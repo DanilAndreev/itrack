@@ -1,4 +1,6 @@
+import os
 import time
+from collections import OrderedDict
 
 import cv2  # type: ignore[reportMissingImports]
 import numpy as np
@@ -15,12 +17,19 @@ ANCHOR_STRIDE = 8
 ANCHOR_RATIOS = (0.33, 0.5, 1.0, 2.0, 3.0)
 ANCHOR_SCALES = (8,)
 
-# Runtime settings (edit these directly in code)
-TEMPLATE_IMAGE_PATH = "../dataset/template.png"
-SEARCH_IMAGE_PATH = "../dataset/search.png"
+# Central debug-runner config (edit directly in code)
+RUN_MODE = "inspect_weights"  # full_track | backbone_only | rpn_only | export_parts | inspect_weights
+DEBUG_LEVEL = "verbose"  # compact | verbose
+CHECKPOINT_PATH = "python/model.pth"  # Example: "model.pth"
+BACKBONE_SAVE_PATH = "python/backbone_weights.pth"
+RPN_SAVE_PATH = "python/rpn_head_weights.pth"
+TEMPLATE_IMAGE_PATH = "dataset/template.png"
+SEARCH_IMAGE_PATH = "dataset/search.png"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WARMUP_RUNS = 10
-BENCHMARK_RUNS = 666
+BENCHMARK_RUNS = 100
+REPORT_KEY_LIMIT = 20
+WEIGHT_EDGE_VALUES = 3
 
 
 def xcorr_depthwise(x, kernel):
@@ -154,36 +163,282 @@ def load_image_as_tensor(image_path, size_hw, device):
     return tensor.to(device)
 
 
-def benchmark(model, template_tensor, search_tensor, warmup, runs, device):
-    model.eval()
-    per_run_times_ms = []
-    with torch.no_grad():
-        model.template(template_tensor)
+def sync_if_cuda(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
-        for _ in tqdm(range(warmup), desc="Warmup", unit="iter"):
-            _ = model.track(search_tensor)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+def timed_benchmark(fn, warmup, runs, device, desc):
+    for _ in tqdm(range(warmup), desc=f"{desc} warmup", unit="iter"):
+        fn()
+    sync_if_cuda(device)
 
-        for _ in tqdm(range(runs), desc="Benchmark", unit="iter"):
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            start = time.perf_counter()
-            output = model.track(search_tensor)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            per_run_times_ms.append(elapsed_ms)
+    run_times_ms = []
+    last_output = None
+    for _ in tqdm(range(runs), desc=f"{desc} benchmark", unit="iter"):
+        sync_if_cuda(device)
+        start = time.perf_counter()
+        last_output = fn()
+        sync_if_cuda(device)
+        run_times_ms.append((time.perf_counter() - start) * 1000.0)
 
-    times = np.array(per_run_times_ms, dtype=np.float64)
-    timing_stats = {
+    times = np.asarray(run_times_ms, dtype=np.float64)
+    stats = {
         "min_ms": float(np.min(times)),
         "max_ms": float(np.max(times)),
         "avg_ms": float(np.mean(times)),
         "median_ms": float(np.median(times)),
     }
-    return output, timing_stats
+    return last_output, stats
+
+
+def tensor_stats(tensor):
+    arr = tensor.detach().float().cpu()
+    return {
+        "shape": tuple(arr.shape),
+        "min": float(arr.min().item()),
+        "max": float(arr.max().item()),
+        "mean": float(arr.mean().item()),
+        "std": float(arr.std(unbiased=False).item()),
+    }
+
+
+def print_tensor_observability(name, tensor, debug_level):
+    stats = tensor_stats(tensor)
+    if debug_level == "compact":
+        print(f"[compact] {name} shape={stats['shape']}")
+        return
+    print(
+        f"[verbose] {name} shape={stats['shape']}, "
+        f"min={stats['min']:.6f}, max={stats['max']:.6f}, "
+        f"mean={stats['mean']:.6f}, std={stats['std']:.6f}"
+    )
+
+
+def print_layer_weight_edges(module, edge_values, debug_level):
+    if debug_level != "verbose":
+        return
+    for name, param in module.named_parameters():
+        if param.numel() == 0:
+            continue
+        flat = param.detach().flatten().float().cpu()
+        head = flat[:edge_values].tolist()
+        tail = flat[-edge_values:].tolist()
+        print(
+            f"[verbose] weight={name}, shape={tuple(param.shape)}, "
+            f"head={head}, tail={tail}"
+        )
+
+
+def normalize_checkpoint_keys(state_dict):
+    prefix_variants = (
+        "module.",
+        "model.",
+        "state_dict.",
+        "net.",
+        "tracker.",
+    )
+    normalized = OrderedDict()
+    key_map = {}
+    for original_key, value in state_dict.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        candidate = original_key
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefix_variants:
+                if candidate.startswith(prefix):
+                    candidate = candidate[len(prefix) :]
+                    changed = True
+        if candidate.startswith("features."):
+            candidate = f"backbone.{candidate}"
+        if candidate.startswith("rpn."):
+            candidate = candidate.replace("rpn.", "rpn_head.", 1)
+        normalized[candidate] = value
+        key_map[original_key] = candidate
+    return normalized, key_map
+
+
+def select_state_dict_from_checkpoint(checkpoint_obj):
+    if isinstance(checkpoint_obj, dict):
+        for key in ("state_dict", "model_state_dict", "model", "weights"):
+            candidate = checkpoint_obj.get(key)
+            if isinstance(candidate, dict):
+                return candidate, key
+        if all(isinstance(v, torch.Tensor) for v in checkpoint_obj.values()):
+            return checkpoint_obj, "state_dict_root"
+    raise ValueError("Unsupported checkpoint format. Expected dict-like state_dict.")
+
+
+def report_load_result(report, limit):
+    print(f"Checkpoint: {report['checkpoint_path']}")
+    print(f"Detected format: {report['format']}")
+    print(
+        "Key stats: "
+        f"raw={report['raw_keys']}, normalized={report['normalized_keys']}, "
+        f"matched={report['matched']}, missing={report['missing']}, "
+        f"unexpected={report['unexpected']}, shape_mismatch={report['shape_mismatch']}"
+    )
+    if report["missing_keys"]:
+        print(f"Missing keys (first {limit}): {report['missing_keys'][:limit]}")
+    if report["unexpected_keys"]:
+        print(f"Unexpected keys (first {limit}): {report['unexpected_keys'][:limit]}")
+    if report["shape_mismatch_details"]:
+        print(
+            f"Shape mismatch keys (first {limit}): "
+            f"{report['shape_mismatch_details'][:limit]}"
+        )
+
+
+def load_checkpoint_auto(model, checkpoint_path, device, report_key_limit):
+    if not checkpoint_path:
+        print("Checkpoint loading skipped: CHECKPOINT_PATH is not set.")
+        return None
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    raw_checkpoint = torch.load(checkpoint_path, map_location=device)
+    raw_state_dict, detected_format = select_state_dict_from_checkpoint(raw_checkpoint)
+    normalized_state, key_map = normalize_checkpoint_keys(raw_state_dict)
+
+    model_state = model.state_dict()
+    filtered = OrderedDict()
+    missing_keys = []
+    shape_mismatch = []
+    used_keys = set()
+
+    for model_key, model_tensor in model_state.items():
+        source_tensor = normalized_state.get(model_key)
+        if source_tensor is None:
+            missing_keys.append(model_key)
+            continue
+        if tuple(source_tensor.shape) != tuple(model_tensor.shape):
+            shape_mismatch.append(
+                {
+                    "key": model_key,
+                    "checkpoint_shape": tuple(source_tensor.shape),
+                    "model_shape": tuple(model_tensor.shape),
+                }
+            )
+            continue
+        filtered[model_key] = source_tensor
+        used_keys.add(model_key)
+
+    unexpected_keys = [k for k in normalized_state.keys() if k not in used_keys]
+    load_result = model.load_state_dict(filtered, strict=False)
+
+    report = {
+        "checkpoint_path": checkpoint_path,
+        "format": detected_format,
+        "raw_keys": len(raw_state_dict),
+        "normalized_keys": len(normalized_state),
+        "matched": len(filtered),
+        "missing": len(missing_keys),
+        "unexpected": len(unexpected_keys),
+        "shape_mismatch": len(shape_mismatch),
+        "missing_keys": missing_keys,
+        "unexpected_keys": unexpected_keys,
+        "shape_mismatch_details": shape_mismatch,
+        "torch_missing_after_load": list(load_result.missing_keys),
+        "torch_unexpected_after_load": list(load_result.unexpected_keys),
+        "key_map_size": len(key_map),
+    }
+    report_load_result(report, report_key_limit)
+    return report
+
+
+def export_backbone_and_rpn(model, backbone_save_path, rpn_save_path, device):
+    torch.save(model.backbone.state_dict(), backbone_save_path)
+    torch.save(model.rpn_head.state_dict(), rpn_save_path)
+    print(f"Saved backbone weights: {backbone_save_path}")
+    print(f"Saved rpn_head weights: {rpn_save_path}")
+
+    fresh = TrackerModel().to(device)
+    backbone_state = torch.load(backbone_save_path, map_location=device)
+    rpn_state = torch.load(rpn_save_path, map_location=device)
+    backbone_result = fresh.backbone.load_state_dict(backbone_state, strict=True)
+    rpn_result = fresh.rpn_head.load_state_dict(rpn_state, strict=True)
+    print(
+        "Export validation: "
+        f"backbone_missing={len(backbone_result.missing_keys)}, "
+        f"backbone_unexpected={len(backbone_result.unexpected_keys)}, "
+        f"rpn_missing={len(rpn_result.missing_keys)}, "
+        f"rpn_unexpected={len(rpn_result.unexpected_keys)}"
+    )
+    return {
+        "backbone_path": backbone_save_path,
+        "rpn_path": rpn_save_path,
+        "backbone_missing": len(backbone_result.missing_keys),
+        "backbone_unexpected": len(backbone_result.unexpected_keys),
+        "rpn_missing": len(rpn_result.missing_keys),
+        "rpn_unexpected": len(rpn_result.unexpected_keys),
+    }
+
+
+def run_full_track(model, template_tensor, search_tensor, warmup, runs, device, debug_level):
+    model.eval()
+    with torch.no_grad():
+        model.template(template_tensor)
+        output, timing_stats = timed_benchmark(
+            lambda: model.track(search_tensor),
+            warmup=warmup,
+            runs=runs,
+            device=device,
+            desc="full_track",
+        )
+    print_tensor_observability("full_track.cls", output["cls"], debug_level)
+    print_tensor_observability("full_track.loc", output["loc"], debug_level)
+    return {"output": output, "timing": timing_stats}
+
+
+def run_backbone_only(model, template_tensor, search_tensor, warmup, runs, device, debug_level):
+    model.eval()
+    with torch.no_grad():
+        template_feature, template_stats = timed_benchmark(
+            lambda: model.backbone(template_tensor),
+            warmup=warmup,
+            runs=runs,
+            device=device,
+            desc="backbone(template)",
+        )
+        search_feature, search_stats = timed_benchmark(
+            lambda: model.backbone(search_tensor),
+            warmup=warmup,
+            runs=runs,
+            device=device,
+            desc="backbone(search)",
+        )
+    print_tensor_observability("backbone.template_feature", template_feature, debug_level)
+    print_tensor_observability("backbone.search_feature", search_feature, debug_level)
+    return {
+        "zf": template_feature,
+        "xf": search_feature,
+        "timing_template": template_stats,
+        "timing_search": search_stats,
+    }
+
+
+def run_rpn_only(model, zf, xf, warmup, runs, device, debug_level):
+    model.eval()
+    with torch.no_grad():
+        output, timing_stats = timed_benchmark(
+            lambda: model.rpn_head(zf, xf),
+            warmup=warmup,
+            runs=runs,
+            device=device,
+            desc="rpn_only",
+        )
+    cls, loc = output
+    print_tensor_observability("rpn_only.cls", cls, debug_level)
+    print_tensor_observability("rpn_only.loc", loc, debug_level)
+    return {"cls": cls, "loc": loc, "timing": timing_stats}
+
+
+def run_inspect_weights(model, debug_level):
+    print("Inspecting model weights...")
+    print_layer_weight_edges(model.backbone, WEIGHT_EDGE_VALUES, debug_level)
+    print_layer_weight_edges(model.rpn_head, WEIGHT_EDGE_VALUES, debug_level)
 
 
 def calc_runtime_shape_stats(instance_size, exemplar_size, stride, base_size, anchor_num):
@@ -198,8 +453,12 @@ def calc_runtime_shape_stats(instance_size, exemplar_size, stride, base_size, an
 
 
 def main():
-    device = torch.device(DEVICE)
+    if RUN_MODE not in {"full_track", "backbone_only", "rpn_only", "export_parts", "inspect_weights"}:
+        raise ValueError(f"Unsupported RUN_MODE: {RUN_MODE}")
+    if DEBUG_LEVEL not in {"compact", "verbose"}:
+        raise ValueError(f"Unsupported DEBUG_LEVEL: {DEBUG_LEVEL}")
 
+    device = torch.device(DEVICE)
     anchor_num = len(ANCHOR_RATIOS) * len(ANCHOR_SCALES)
     stats = calc_runtime_shape_stats(
         instance_size=INSTANCE_SIZE,
@@ -208,27 +467,16 @@ def main():
         base_size=BASE_SIZE,
         anchor_num=anchor_num,
     )
-
-    template = load_image_as_tensor(
-        TEMPLATE_IMAGE_PATH, size_hw=(EXEMPLAR_SIZE, EXEMPLAR_SIZE), device=device
-    )
-    search = load_image_as_tensor(
-        SEARCH_IMAGE_PATH, size_hw=(INSTANCE_SIZE, INSTANCE_SIZE), device=device
-    )
-
     model = TrackerModel().to(device)
-    output, timing_stats = benchmark(
+    _ = load_checkpoint_auto(
         model=model,
-        template_tensor=template,
-        search_tensor=search,
-        warmup=WARMUP_RUNS,
-        runs=BENCHMARK_RUNS,
+        checkpoint_path=CHECKPOINT_PATH,
         device=device,
+        report_key_limit=REPORT_KEY_LIMIT,
     )
 
-    cls_shape = tuple(output["cls"].shape)
-    loc_shape = tuple(output["loc"].shape)
     print(f"Device: {device}")
+    print(f"RUN_MODE={RUN_MODE}, DEBUG_LEVEL={DEBUG_LEVEL}")
     print(
         "Tracking geometry: "
         f"instance={INSTANCE_SIZE}, exemplar={EXEMPLAR_SIZE}, stride={ANCHOR_STRIDE}, "
@@ -239,13 +487,86 @@ def main():
         f"score_size={stats['score_size']}x{stats['score_size']}, "
         f"positions={stats['positions']}, candidates={stats['candidates']}"
     )
-    print(f"Output cls shape: {cls_shape}")
-    print(f"Output loc shape: {loc_shape}")
-    print(f"Timing min:    {timing_stats['min_ms']:.3f} ms")
-    print(f"Timing max:    {timing_stats['max_ms']:.3f} ms")
-    print(f"Timing avg:    {timing_stats['avg_ms']:.3f} ms")
-    print(f"Timing median: {timing_stats['median_ms']:.3f} ms")
-    print(f"(runs={BENCHMARK_RUNS}, warmup={WARMUP_RUNS})")
+
+    if RUN_MODE == "inspect_weights":
+        run_inspect_weights(model, DEBUG_LEVEL)
+        return
+
+    template = load_image_as_tensor(
+        TEMPLATE_IMAGE_PATH, size_hw=(EXEMPLAR_SIZE, EXEMPLAR_SIZE), device=device
+    )
+    search = load_image_as_tensor(
+        SEARCH_IMAGE_PATH, size_hw=(INSTANCE_SIZE, INSTANCE_SIZE), device=device
+    )
+    print_tensor_observability("input.template", template, DEBUG_LEVEL)
+    print_tensor_observability("input.search", search, DEBUG_LEVEL)
+
+    if RUN_MODE == "full_track":
+        result = run_full_track(
+            model=model,
+            template_tensor=template,
+            search_tensor=search,
+            warmup=WARMUP_RUNS,
+            runs=BENCHMARK_RUNS,
+            device=device,
+            debug_level=DEBUG_LEVEL,
+        )
+        output = result["output"]
+        timing_stats = result["timing"]
+        print(f"Output cls shape: {tuple(output['cls'].shape)}")
+        print(f"Output loc shape: {tuple(output['loc'].shape)}")
+        print(f"Timing min:    {timing_stats['min_ms']:.3f} ms")
+        print(f"Timing max:    {timing_stats['max_ms']:.3f} ms")
+        print(f"Timing avg:    {timing_stats['avg_ms']:.3f} ms")
+        print(f"Timing median: {timing_stats['median_ms']:.3f} ms")
+        print(f"(runs={BENCHMARK_RUNS}, warmup={WARMUP_RUNS})")
+        return
+
+    backbone_result = run_backbone_only(
+        model=model,
+        template_tensor=template,
+        search_tensor=search,
+        warmup=WARMUP_RUNS,
+        runs=BENCHMARK_RUNS,
+        device=device,
+        debug_level=DEBUG_LEVEL,
+    )
+    print(
+        "Backbone timing template(ms): "
+        f"{backbone_result['timing_template']['avg_ms']:.3f} avg / "
+        f"{backbone_result['timing_template']['median_ms']:.3f} median"
+    )
+    print(
+        "Backbone timing search(ms): "
+        f"{backbone_result['timing_search']['avg_ms']:.3f} avg / "
+        f"{backbone_result['timing_search']['median_ms']:.3f} median"
+    )
+
+    if RUN_MODE == "backbone_only":
+        return
+
+    if RUN_MODE == "export_parts":
+        export_backbone_and_rpn(
+            model=model,
+            backbone_save_path=BACKBONE_SAVE_PATH,
+            rpn_save_path=RPN_SAVE_PATH,
+            device=device,
+        )
+
+    if RUN_MODE in {"rpn_only", "export_parts"}:
+        rpn_result = run_rpn_only(
+            model=model,
+            zf=backbone_result["zf"],
+            xf=backbone_result["xf"],
+            warmup=WARMUP_RUNS,
+            runs=BENCHMARK_RUNS,
+            device=device,
+            debug_level=DEBUG_LEVEL,
+        )
+        print(f"RPN cls shape: {tuple(rpn_result['cls'].shape)}")
+        print(f"RPN loc shape: {tuple(rpn_result['loc'].shape)}")
+        print(f"RPN timing avg: {rpn_result['timing']['avg_ms']:.3f} ms")
+        print(f"RPN timing median: {rpn_result['timing']['median_ms']:.3f} ms")
 
 
 if __name__ == "__main__":
