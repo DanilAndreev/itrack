@@ -6,9 +6,12 @@ set(CMAKE_CUDA_STANDARD 20)
 set(SOURCE_FILES
         src/main.cu
         src/stb_impl.cu
+        src/LayerKernels.cu
     )
 set(HEADER_FILES
         src/pch.cuh
+        src/LayerKernels.cuh
+        src/Utils.h
 )
 
 add_executable(itrack ${HEADER_FILES} ${SOURCE_FILES})

@@ -15,3 +15,5 @@ constexpr auto IntDivideCeil(T intValue, T factor) noexcept
 {
     return (intValue + factor - 1) / factor;
 }
+
+using uint = uint32_t;
