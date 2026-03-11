@@ -1,4 +1,5 @@
 import os
+import struct
 import time
 from collections import OrderedDict
 
@@ -215,6 +216,11 @@ def print_tensor_observability(name, tensor, debug_level):
     )
 
 
+def dump_float_list_to_file_binary(filepath: str, l: list):
+    with open(filepath, "wb") as f:
+        f.write(struct.pack('f' * len(l), *l))
+
+
 def print_layer_weight_edges(module, edge_values, debug_level):
     if debug_level != "verbose":
         return
@@ -224,10 +230,14 @@ def print_layer_weight_edges(module, edge_values, debug_level):
         flat = param.detach().flatten().float().cpu()
         head = flat[:edge_values].tolist()
         tail = flat[-edge_values:].tolist()
+        os.makedirs("weights", exist_ok=True)
         print(
             f"[verbose] weight={name}, shape={tuple(param.shape)}, "
             f"head={head}, tail={tail}"
         )
+        dump_float_list_to_file_binary(os.path.join("weights", f"{name}.bytes"), flat)
+        with open(os.path.join("weights", f"{name}.meta.txt"), "w") as f:
+            f.write(f"{tuple(param.shape)}")
 
 
 def normalize_checkpoint_keys(state_dict):
