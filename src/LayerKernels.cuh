@@ -29,7 +29,7 @@ namespace Kernels {
         scratchReduce[blockIdx.x * 2 + 1] = maxVal;
     }
 
-    __global__ void Conv2D(uint4 dim, uint stride, const float* filter, const float* srcTensor, float* dstTensor);
+    __global__ void Conv2D(uint4 dim, uint stride, const float* filter, const float* bias,  const float* srcTensor, float* dstTensor);
 
     __global__ void MaxPool2DWrp(uint4 dim, uint windowSize, uint stride, float* srcTensor, float* dstTensor);
 
@@ -65,7 +65,7 @@ namespace Layers {
     }
 
     void ReLU(uint4 dim, float* tensor);
-    uint4 Conv2D(uint4 dim, uint filterSize, uint stride, uint filterCount, const float* filter, const float* srcTensor, float* dstTensor);
+    uint4 Conv2D(uint4 dim, uint filterSize, uint stride, uint filterCount, const float* filter, const float* bias, const float* srcTensor, float* dstTensor);
     uint4 MaxPool2D(uint4 dim, uint windowSize, uint stride, float* srcTensor, float* dstTensor);
     void BatchNorm2D(uint4 dim, float* tensor);
 }

@@ -17,7 +17,7 @@ namespace Kernels {
     }
 
     //TODO: Naive implementation. Currently it wastes a lot of lanes per warp. Will be optimized later.
-    __global__ void Conv2D(uint4 dim, uint stride, const float* filter, const float* srcTensor, float* dstTensor) {
+    __global__ void Conv2DSum(uint4 dim, uint stride, const float* filter, const float* srcTensor, float* dstTensor) {
         uint filterIdx = blockIdx.z / dim.z;
         uint chIdx = blockIdx.z % dim.z;
         uint elY = blockIdx.y * stride + threadIdx.y;
@@ -33,6 +33,15 @@ namespace Kernels {
         const float filterVal = filter[filterLinearIdx];
         float weighted = srcTensor[srcLinearIdx] * filterVal;
         atomicAdd(&dstTensor[filterIdx * (gridDim.x * gridDim.y) + blockIdx.y * gridDim.x + blockIdx.x], weighted);
+    }
+
+    __global__ void Conv2DBias(uint4 dim, const float* bias, float* tensor) {
+        const uint3 dtID = {blockIdx.x * blockDim.x + threadIdx.x,
+                            blockIdx.y * blockDim.y + threadIdx.y,
+                            blockIdx.z * blockDim.z + threadIdx.z};
+        if (dtID.x < dim.x && dtID.y < dim.y && dtID.z < dim.z) {
+            tensor[dtID.y * dim.x + dtID.x] += bias[dtID.z];
+        }
     }
 
     // Naive implementation that underutilizes warp threads and has unoptimal memory pattern. Will be optimized in the future.
@@ -106,12 +115,16 @@ namespace Layers {
         Kernels::ReLU<<<gridsize, groupsize>>>(dim, tensor);
     }
 
-    uint4 Conv2D(uint4 dim, uint filterSize, uint stride, uint filterCount, const float* filter, const float* srcTensor, float* dstTensor) {
+    uint4 Conv2D(uint4 dim, uint filterSize, uint stride, uint filterCount, const float* filter, const float* bias, const float* srcTensor, float* dstTensor) {
         uint3 groupsize = {filterSize, filterSize, 1};
         uint3 gridsize = {dim.x / stride, dim.y / stride , dim.z * filterCount};
+        Kernels::Conv2DSum<<<gridsize, groupsize>>>(dim, stride, filter, srcTensor, dstTensor);
+        uint4 outDim = {gridsize.x, gridsize.y, filterCount, dim.w};
 
-        Kernels::Conv2D<<<gridsize, groupsize>>>(dim, stride, filter, srcTensor, dstTensor);
-        return {gridsize.x, gridsize.y, filterCount, dim.w};
+        groupsize = {8, 8, 1};
+        gridsize = {IntDivideCeil(outDim.x, groupsize.x), IntDivideCeil(outDim.y, groupsize.y), outDim.z};
+        // Kernels::Conv2DBias<<<gridsize, groupsize>>>(outDim, bias, dstTensor);
+        return outDim;
     }
 
     uint4 MaxPool2D(uint4 dim, uint windowSize, uint stride, float* srcTensor, float* dstTensor) {

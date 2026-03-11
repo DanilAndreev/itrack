@@ -23,8 +23,38 @@ float* DeviceAllocAndFillFilter(uint filterSize, uint chCount, uint filterCount)
     return dFilter;
 }
 
+float* DeviceAllocAndLoadFilter(uint filterSize, uint chCount, uint filterCount, const std::string& filename) {
+    std::ifstream file{filename, std::ios::binary};
+    assert(file.is_open());
+    std::vector<float> staging{};
+    staging.resize(filterCount * chCount * filterSize * filterSize);
+    file.read(reinterpret_cast<char*>(staging.data()), staging.size() * sizeof(staging[0]));
+    assert(!file.bad() && !file.fail());
+    file.close();
+
+    float *dFilter;
+    cudaMalloc(&dFilter, staging.size() * sizeof(float));
+    cudaMemcpy(dFilter, staging.data(), staging.size() * sizeof(float), cudaMemcpyHostToDevice);
+    return dFilter;
+}
+
+float* DeviceAllocAndLoadTensor(uint4 dim, const std::string& filename) {
+    std::ifstream file{filename, std::ios::binary};
+    assert(file.is_open());
+    std::vector<float> staging{};
+    staging.resize(dim.w * dim.z * dim.y * dim.x);
+    file.read(reinterpret_cast<char*>(staging.data()), staging.size() * sizeof(staging[0]));
+    assert(!file.bad() && !file.fail());
+    file.close();
+
+    float *dTensor;
+    cudaMalloc(&dTensor, staging.size() * sizeof(float));
+    cudaMemcpy(dTensor, staging.data(), staging.size() * sizeof(float), cudaMemcpyHostToDevice);
+    return dTensor;
+}
+
 int main() {
-    std::cout << "Hello, World!" << std::endl;
+    std::ofstream dumpFile{"DumpTensor"};
 
     int channels = 3;
     int width, height, chInFile;
@@ -42,6 +72,8 @@ int main() {
             unsigned char b = img[(y * width + x) * channels + 2];
 
             float v = static_cast<float>(r) / 255.f;
+            v = std::max(v, static_cast<float>(g) / 255.f);
+            v = std::max(v, static_cast<float>(b) / 255.f);
             if (v == 0) {
                 printf(" ");
             } else if (v < 0.25f) {
@@ -56,6 +88,7 @@ int main() {
         }
         printf("\n");
     }
+    fflush(stdout);
 
     constexpr uint L0_FILTER_COUNT = 96;
 
@@ -78,6 +111,7 @@ int main() {
     float* dTensorMemB;
 
     float* dFilterWL0;
+    float* dBiasWL0;
 
     assert(tDim.w == 1);
 
@@ -86,18 +120,21 @@ int main() {
     SUCC(cudaMalloc(&dTensorMemB, TMP_MEM_EL * sizeof(float)));
 
     cudaMemcpy(dTensorMemA, tensorStaging.data(), tensorStaging.size() * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(dTensorMemB, 0, tDim.x * tDim.y * 384 * sizeof(float));
-
-    cudaMalloc(&dFilterWL0, L0_FILTER_COUNT * tDim.z * 11 * 11 * sizeof(float));
-
-    dFilterWL0 = DeviceAllocAndFillFilter(11, tDim.z, L0_FILTER_COUNT);
-    tDim = Layers::Conv2D(tDim, 11, 2, L0_FILTER_COUNT, dFilterWL0, dTensorMemA, dTensorMemB);
-    cudaMemset(dTensorMemA, 0, TMP_MEM_EL * sizeof(float));
-    Layers::BatchNorm2D(tDim, dTensorMemB);
-    tDim = Layers::MaxPool2D(tDim, 3, 2, dTensorMemB, dTensorMemA);
     cudaMemset(dTensorMemB, 0, TMP_MEM_EL * sizeof(float));
-    Layers::ReLU(tDim, dTensorMemA);
-    Utils::ReadbackAndPrint4D(dTensorMemA, tDim);
+
+    dFilterWL0 = DeviceAllocAndLoadFilter(11, tDim.z, L0_FILTER_COUNT, "weights/features.0.weight.bytes");
+    dBiasWL0 = DeviceAllocAndLoadTensor({1, 1, 1, L0_FILTER_COUNT}, "weights/features.0.bias.bytes");
+
+    tDim = Layers::Conv2D(tDim, 11, 2, L0_FILTER_COUNT, dFilterWL0, dBiasWL0, dTensorMemA, dTensorMemB);
+
+
+    Utils::ReadbackAndPrint4D(dTensorMemB, tDim, dumpFile);
+    // cudaMemset(dTensorMemA, 0, TMP_MEM_EL * sizeof(float));
+    // Layers::BatchNorm2D(tDim, dTensorMemB);
+    // tDim = Layers::MaxPool2D(tDim, 3, 2, dTensorMemB, dTensorMemA);
+    // cudaMemset(dTensorMemB, 0, TMP_MEM_EL * sizeof(float));
+    // Layers::ReLU(tDim, dTensorMemA);
+    // Utils::ReadbackAndPrint4D(dTensorMemA, tDim);
 
     return 0;
 }

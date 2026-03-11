@@ -1,5 +1,4 @@
 import os
-import struct
 import time
 from collections import OrderedDict
 
@@ -31,6 +30,7 @@ WARMUP_RUNS = 10
 BENCHMARK_RUNS = 100
 REPORT_KEY_LIMIT = 20
 WEIGHT_EDGE_VALUES = 3
+OUTPUT_EDGE_VALUES = 10
 
 
 def xcorr_depthwise(x, kernel):
@@ -204,21 +204,25 @@ def tensor_stats(tensor):
     }
 
 
+def tensor_edges(tensor, edge_values):
+    arr = tensor.detach().flatten().float().cpu()
+    head = arr[:edge_values].tolist()
+    tail = arr[-edge_values:].tolist()
+    return head, tail
+
+
 def print_tensor_observability(name, tensor, debug_level):
     stats = tensor_stats(tensor)
+    head, tail = tensor_edges(tensor, OUTPUT_EDGE_VALUES)
     if debug_level == "compact":
-        print(f"[compact] {name} shape={stats['shape']}")
+        print(f"[compact] {name} shape={stats['shape']}, head={[f"{x:.2e}" for x in head]}, tail={[f"{x:.2e}" for x in tail]}")
         return
     print(
         f"[verbose] {name} shape={stats['shape']}, "
         f"min={stats['min']:.6f}, max={stats['max']:.6f}, "
-        f"mean={stats['mean']:.6f}, std={stats['std']:.6f}"
+        f"mean={stats['mean']:.6f}, std={stats['std']:.6f}, "
+        f"head={head}, tail={tail}"
     )
-
-
-def dump_float_list_to_file_binary(filepath: str, l: list):
-    with open(filepath, "wb") as f:
-        f.write(struct.pack('f' * len(l), *l))
 
 
 def print_layer_weight_edges(module, edge_values, debug_level):
@@ -230,14 +234,89 @@ def print_layer_weight_edges(module, edge_values, debug_level):
         flat = param.detach().flatten().float().cpu()
         head = flat[:edge_values].tolist()
         tail = flat[-edge_values:].tolist()
-        os.makedirs("weights", exist_ok=True)
         print(
             f"[verbose] weight={name}, shape={tuple(param.shape)}, "
             f"head={head}, tail={tail}"
         )
-        dump_float_list_to_file_binary(os.path.join("weights", f"{name}.bytes"), flat)
-        with open(os.path.join("weights", f"{name}.meta.txt"), "w") as f:
-            f.write(f"{tuple(param.shape)}")
+        # os.makedirs("weights", exist_ok=True)
+        # dump_float_list_to_file_binary(os.path.join("weights", f"{name}.bytes"), flat)
+        # with open(os.path.join("weights", f"{name}.meta.txt"), "w") as f:
+        #     f.write(f"{tuple(param.shape)}")
+
+
+def _collect_output_tensors(value, prefix):
+    if isinstance(value, torch.Tensor):
+        return [(prefix, value)]
+    if isinstance(value, (list, tuple)):
+        items = []
+        for idx, item in enumerate(value):
+            items.extend(_collect_output_tensors(item, f"{prefix}[{idx}]"))
+        return items
+    if isinstance(value, dict):
+        items = []
+        for key, item in value.items():
+            items.extend(_collect_output_tensors(item, f"{prefix}.{key}"))
+        return items
+    return []
+
+
+def _pretty_layer_path(raw_path):
+    parts = raw_path.split(".")
+    pretty_parts = []
+    for part in parts:
+        if part.isdigit() and pretty_parts:
+            pretty_parts[-1] = f"{pretty_parts[-1]}[{part}]"
+        else:
+            pretty_parts.append(part)
+    return ".".join(pretty_parts)
+
+
+def _layer_display_name(module_label, sub_name, sub_module):
+    pretty_sub_name = _pretty_layer_path(sub_name)
+    layer_type = sub_module.__class__.__name__
+    return f"{module_label} > {pretty_sub_name} ({layer_type})"
+
+
+def run_layer_output_observability(run_fn, modules_to_hook, section_title, debug_level):
+    records = []
+    call_counts = {}
+    handles = []
+
+    for module_label, module in modules_to_hook:
+        for sub_name, sub_module in module.named_modules():
+            # Log every leaf layer output (including non-param layers like ReLU/Pool)
+            # to keep layer indices contiguous and easy to follow.
+            if sub_name == "":
+                continue
+            is_leaf = len(list(sub_module.children())) == 0
+            if not is_leaf:
+                continue
+            full_name = _layer_display_name(module_label, sub_name, sub_module)
+
+            def _hook(_module, _inputs, output, layer_name=full_name):
+                call_index = call_counts.get(layer_name, 0) + 1
+                call_counts[layer_name] = call_index
+                output_tensors = _collect_output_tensors(output, prefix=layer_name)
+                for output_name, output_tensor in output_tensors:
+                    if not isinstance(output_tensor, torch.Tensor):
+                        continue
+                    records.append((f"{output_name}#call{call_index}", output_tensor))
+
+            handles.append(sub_module.register_forward_hook(_hook))
+
+    try:
+        run_fn()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    print(f"Layer output observability [{section_title}]")
+    if not records:
+        print("  No layer outputs captured.")
+        return
+
+    for layer_name, tensor in records:
+        print_tensor_observability(layer_name, tensor, debug_level)
 
 
 def normalize_checkpoint_keys(state_dict):
@@ -397,6 +476,21 @@ def run_full_track(model, template_tensor, search_tensor, warmup, runs, device, 
             device=device,
             desc="full_track",
         )
+        run_layer_output_observability(
+            run_fn=lambda: model.template(template_tensor),
+            modules_to_hook=[("full_track.template.backbone", model.backbone)],
+            section_title="full_track template",
+            debug_level=debug_level,
+        )
+        run_layer_output_observability(
+            run_fn=lambda: model.track(search_tensor),
+            modules_to_hook=[
+                ("full_track.track.backbone", model.backbone),
+                ("full_track.track.rpn_head", model.rpn_head),
+            ],
+            section_title="full_track track",
+            debug_level=debug_level,
+        )
     print_tensor_observability("full_track.cls", output["cls"], debug_level)
     print_tensor_observability("full_track.loc", output["loc"], debug_level)
     return {"output": output, "timing": timing_stats}
@@ -419,6 +513,18 @@ def run_backbone_only(model, template_tensor, search_tensor, warmup, runs, devic
             device=device,
             desc="backbone(search)",
         )
+        run_layer_output_observability(
+            run_fn=lambda: model.backbone(template_tensor),
+            modules_to_hook=[("backbone.template", model.backbone)],
+            section_title="backbone template",
+            debug_level=debug_level,
+        )
+        run_layer_output_observability(
+            run_fn=lambda: model.backbone(search_tensor),
+            modules_to_hook=[("backbone.search", model.backbone)],
+            section_title="backbone search",
+            debug_level=debug_level,
+        )
     print_tensor_observability("backbone.template_feature", template_feature, debug_level)
     print_tensor_observability("backbone.search_feature", search_feature, debug_level)
     return {
@@ -438,6 +544,12 @@ def run_rpn_only(model, zf, xf, warmup, runs, device, debug_level):
             runs=runs,
             device=device,
             desc="rpn_only",
+        )
+        run_layer_output_observability(
+            run_fn=lambda: model.rpn_head(zf, xf),
+            modules_to_hook=[("rpn_only", model.rpn_head)],
+            section_title="rpn_only",
+            debug_level=debug_level,
         )
     cls, loc = output
     print_tensor_observability("rpn_only.cls", cls, debug_level)
